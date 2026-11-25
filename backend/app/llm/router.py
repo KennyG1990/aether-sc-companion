@@ -884,6 +884,16 @@ class LLMRouter:
                     "blunt",
                     "casual",
                     "percentage",
+                    "stop mentioning",
+                    "don't mention",
+                    "do not mention",
+                    "stop warning",
+                    "don't warn",
+                    "shut up about",
+                    "ignore shield",
+                    "ignore fuel",
+                    "not mention",
+                    "avoid mentioning",
                 )
                 if mem_domain != "personality" and any(cue in low_c for cue in personality_cues):
                     mem_domain = "personality"

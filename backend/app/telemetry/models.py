@@ -58,6 +58,7 @@ class ShipTelemetry(BaseModel):
     hydrogen_fuel_pct: float = 78.0
     quantum_fuel_pct: float = 64.0
     hull_pct: float = 100.0
+    ammo_pct: float = 100.0
     shields: ShieldQuadrants = Field(default_factory=ShieldQuadrants)
     master_mode: str = "SCM"  # SCM | NAV
     landing_gear_down: bool = False
@@ -65,6 +66,7 @@ class ShipTelemetry(BaseModel):
     vtol_enabled: bool = False
     doors_open: bool = False
     quantum_spooling: bool = False
+    in_quantum: bool = False
     flight_assist: bool = True
     under_fire: bool = False
     radar_locks: list[RadarLockThreat] = Field(default_factory=list)
@@ -74,6 +76,8 @@ class ShipTelemetry(BaseModel):
 
 
 class AllyShipState(BaseModel):
+    """Strictly structured ally game-state telemetry — ZERO chat, prompts, or voice transcripts!"""
+
     callsign: str
     pilot_name: str
     ship_name: str
@@ -87,8 +91,16 @@ class AllyShipState(BaseModel):
     shields_pct: float = 100.0
     hull_pct: float = 100.0
     fuel_pct: float = 85.0
+    ammo_pct: float = 100.0
+    health_pct: float = 100.0
+    oxygen_pct: float = 100.0
+    master_mode: str = "SCM"
     status: str = "PATROL"  # PATROL | COMBAT | QUANTUM | DOCKED | DISTRESS
     under_fire: bool = False
+    radar_locked: bool = False
+    incoming_missile: bool = False
+    incapacitated: bool = False
+    shard_id: str = ""
     last_seen: float = Field(default_factory=time.time)
     relay_source: str = "simulated"
 

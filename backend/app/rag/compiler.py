@@ -157,7 +157,11 @@ class PromptCompiler:
 
         compact_fleet = (
             "\n".join(
-                f"- {a['callsign']} ({a['ship_name']}, {a['role']}): {a['zone']} [{a['status']} | SHD {float(a['shields_pct']):.0f}% | HULL {float(a['hull_pct']):.0f}%]"
+                f"- {a['callsign']} ({a['ship_name']}, {a['role']}): {a['zone']} "
+                f"[{a['status']} | SHD {float(a['shields_pct']):.0f}% | HULL {float(a['hull_pct']):.0f}% | "
+                f"AMMO {float(a.get('ammo_pct', 100)):.0f}% | HP {float(a.get('health_pct', 100)):.0f}%"
+                f"{' | INCAPACITATED' if a.get('incapacitated') else ''}"
+                f"{' | MISSILE INBOUND' if a.get('incoming_missile') else ''}]"
                 for a in fleet_snapshot
             )
             if fleet_snapshot

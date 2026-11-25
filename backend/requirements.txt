@@ -6,4 +6,5 @@ websockets==14.1
 python-multipart==0.0.34
 grpcio==1.69.0
 protobuf==5.29.2
+cryptography>=44.0.0
 pytest==8.3.4

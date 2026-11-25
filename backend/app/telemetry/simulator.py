@@ -147,7 +147,13 @@ class TelemetrySimulator:
                 for lk in self.ship.radar_locks:
                     lk.distance_m = max(450.0, round(lk.distance_m - lk.closing_speed_mps * dt * 0.25, 1))
 
-        # Derive alert level
+        # Derive alert level (context-aware: shields dropping in NAV/Quantum is normal Star Citizen behavior!)
+        shields_expected_online = (
+            self.ship.master_mode.upper() == "SCM"
+            and not self.ship.quantum_spooling
+            and not self.ship.in_quantum
+            and not (self.ship.landing_gear_down and self.ship.speed_mps < 25.0)
+        )
         min_shield = min(
             self.ship.shields.front,
             self.ship.shields.back,
@@ -157,11 +163,15 @@ class TelemetrySimulator:
         if (
             self.ship.under_fire
             or self.ship.incoming_missiles
-            or min_shield < 30.0
+            or (shields_expected_online and min_shield < 30.0)
             or self.ship.vitals.oxygen_pct < 35.0
         ):
             self.ship.alert_level = "COMBAT"
-        elif self.ship.radar_locks or self.ship.hydrogen_fuel_pct < 20.0 or min_shield < 60.0:
+        elif (
+            self.ship.radar_locks
+            or self.ship.hydrogen_fuel_pct < 20.0
+            or (shields_expected_online and min_shield < 60.0)
+        ):
             self.ship.alert_level = "CAUTION"
         else:
             self.ship.alert_level = "NOMINAL"
@@ -263,12 +273,26 @@ class TelemetrySimulator:
                 )
             ]
             return "Simulated incoming IR missile launched from five o'clock low (3.2 km, 680 m/s)."
+        if scenario == "ally_critical":
+            kestrel = self.allies.get("Kestrel")
+            if kestrel:
+                kestrel.status = "DISTRESS"
+                kestrel.under_fire = True
+                kestrel.shields_pct = 8.0
+                kestrel.hull_pct = 18.0
+                kestrel.health_pct = 22.0
+                kestrel.ammo_pct = 0.0
+                kestrel.incoming_missile = True
+            return "Simulated buddy critical state: Kestrel almost dead (hull 18%, health 22%) and out of ammo near Grim HEX."
         if scenario == "all_clear":
             self._combat_until = 0.0
             self._lock_until = 0.0
             self.ship.under_fire = False
             self.ship.radar_locks = []
             self.ship.incoming_missiles = []
+            self.ship.master_mode = "SCM"
+            self.ship.quantum_spooling = False
+            self.ship.in_quantum = False
             self.ship.shields.front = 100.0
             self.ship.shields.back = 100.0
             self.ship.shields.left = 100.0
@@ -277,10 +301,15 @@ class TelemetrySimulator:
             self.ship.vitals.oxygen_pct = 100.0
             for ally in self.allies.values():
                 ally.under_fire = False
+                ally.incoming_missile = False
+                ally.radar_locked = False
+                ally.incapacitated = False
                 if ally.status == "DISTRESS":
                     ally.status = "PATROL"
                 ally.shields_pct = 100.0
                 ally.hull_pct = 100.0
+                ally.health_pct = 100.0
+                ally.ammo_pct = 100.0
             return "All systems restored to NOMINAL."
         return f"Unknown scenario '{scenario}'."
 
@@ -301,10 +330,18 @@ class TelemetrySimulator:
             shields_pct=float(payload.get("shields_pct", 100.0)),
             hull_pct=float(payload.get("hull_pct", 100.0)),
             fuel_pct=float(payload.get("fuel_pct", 80.0)),
+            ammo_pct=float(payload.get("ammo_pct", 100.0)),
+            health_pct=float(payload.get("health_pct", 100.0)),
+            oxygen_pct=float(payload.get("oxygen_pct", 100.0)),
+            master_mode=str(payload.get("master_mode", "SCM"))[:12],
             status=str(payload.get("status", "PATROL"))[:24],
             under_fire=bool(payload.get("under_fire", False)),
+            radar_locked=bool(payload.get("radar_locked", False)),
+            incoming_missile=bool(payload.get("incoming_missile", False)),
+            incapacitated=bool(payload.get("incapacitated", False)),
+            shard_id=str(payload.get("shard_id", ""))[:48],
             last_seen=time.time(),
-            relay_source="live_relay",
+            relay_source=str(payload.get("relay_source", "live_relay"))[:24],
         )
         self.allies[callsign] = ally
         return ally

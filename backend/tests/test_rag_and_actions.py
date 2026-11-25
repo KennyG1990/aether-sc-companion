@@ -240,4 +240,104 @@ def test_living_personality_memory_always_in_prompt_and_shapes_missile_alerts(tm
     assert "%" not in msl_plain.summary
 
 
+def test_nav_quantum_shields_no_false_alarm_and_personality_muting() -> None:
+    from app.telemetry.triggers import TriggerEngine
+
+    sim = TelemetrySimulator()
+    triggers = TriggerEngine(cooldown_seconds=0.1)
+
+    # 1. Switch into NAV / Quantum mode -> shields drop to 0% naturally; MUST NOT fire SHIELDS_CRITICAL or COMBAT!
+    sim.apply_action("set_master_mode_nav", {})
+    sim.ship.shields.front = 0.0
+    sim.ship.shields.back = 0.0
+    sim.ship.shields.left = 0.0
+    sim.ship.shields.right = 0.0
+    ship, fleet = sim.step()
+    assert ship.alert_level == "NOMINAL"
+    ev_nav = triggers.evaluate(ship, fleet, personality_memories=[])
+    assert not any(e.event_type == "SHIELDS_CRITICAL" for e in ev_nav)
+
+    # 2. Switch back to SCM with low shields -> fires ONCE, then hysteresis latch prevents repeating nag spam!
+    sim.apply_action("set_master_mode_scm", {})
+    sim.ship.shields.front = 18.0
+    ev_once = triggers.evaluate(sim.ship, fleet, personality_memories=[])
+    assert sum(1 for e in ev_once if e.event_type == "SHIELDS_CRITICAL") == 1
+    ev_repeat = triggers.evaluate(sim.ship, fleet, personality_memories=[])
+    assert not any(e.event_type == "SHIELDS_CRITICAL" for e in ev_repeat), "Hysteresis latch must stop nagging"
+
+    # 3. Living Personality muting: telling AETHER "stop mentioning my shields" silences even fresh drops!
+    sim.ship.shields.front = 80.0
+    triggers.evaluate(sim.ship, fleet, personality_memories=[])  # re-arm latch
+    sim.ship.shields.front = 15.0
+    ev_muted = triggers.evaluate(
+        sim.ship,
+        fleet,
+        personality_memories=["Stop mentioning my shields when they go down."],
+    )
+    assert not any(e.event_type == "SHIELDS_CRITICAL" for e in ev_muted)
+
+
+def test_encrypted_squad_lobby_e2e_and_zero_chat_privacy_firewall() -> None:
+    import pytest
+    from pydantic import ValidationError
+    from app.network.lobby import (
+        SquadStatePacket,
+        decrypt_state_packet,
+        encrypt_state_packet,
+        generate_invite_code,
+    )
+    from app.telemetry.triggers import TriggerEngine
+
+    code = generate_invite_code()
+    wrong_code = generate_invite_code()
+    assert code.startswith("AETHER-") and code != wrong_code
+
+    # 1. Pure game-state packet encrypts with AES-256-GCM and decrypts cleanly with matching invite code
+    pkt = SquadStatePacket(
+        peer_id="peer_buddy01",
+        callsign="Kestrel",
+        ship_name="Anvil F7A Hornet Mk II",
+        zone="Yela / Grim HEX",
+        shields_pct=10.0,
+        hull_pct=18.0,
+        health_pct=20.0,
+        ammo_pct=0.0,
+        incoming_missile=True,
+        under_fire=True,
+        status="DISTRESS",
+    )
+    wire = encrypt_state_packet(pkt, code)
+    assert "Kestrel" not in str(wire), "Plaintext callsign must never appear on the encrypted wire!"
+
+    decoded = decrypt_state_packet(wire, code)
+    assert decoded.callsign == "Kestrel"
+    assert decoded.ammo_pct == 0.0
+    assert decoded.health_pct == 20.0
+
+    # 2. Wrong invite code MUST fail GCM authentication
+    with pytest.raises(ValueError):
+        decrypt_state_packet(wire, wrong_code)
+
+    # 3. Strict Zero-Chat Privacy Firewall: smuggling chat/prompt/message fields is FORBIDDEN!
+    with pytest.raises(ValidationError):
+        SquadStatePacket.model_validate(
+            {**pkt.model_dump(), "chat_message": "roleplaying secret conversation"}
+        )
+
+    # 4. Decrypted buddy game state drives YOUR AETHER's voice warnings purely from telemetry!
+    sim = TelemetrySimulator()
+    sim.upsert_relay_ally({**decoded.model_dump(), "relay_source": "encrypted_lobby"})
+    triggers = TriggerEngine(cooldown_seconds=1.0)
+    ev = triggers.evaluate(
+        sim.ship,
+        list(sim.allies.values()),
+        personality_memories=["Speak plainly, no raw statistics."],
+    )
+    ev_types = {e.event_type for e in ev}
+    assert "ALLY_CRITICAL" in ev_types
+    assert "ALLY_OUT_OF_AMMO" in ev_types
+    assert "ALLY_INCOMING_MISSILE" in ev_types
+
+
+
 

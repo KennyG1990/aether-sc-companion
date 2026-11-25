@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Sparkles, HeartPulse, Music } from "lucide-react";
+import { Sparkles, HeartPulse, Music, ShieldCheck, Copy, Users } from "lucide-react";
 import {
   ActionReceipt,
   AetherConfigData,
@@ -84,6 +84,12 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   const [spotifyNotice, setSpotifyNotice] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
 
+  // Encrypted Squad Lobby state (AES-256-GCM, pure telemetry — zero chat)
+  const [lobby, setLobby] = useState<any>(null);
+  const [joinCode, setJoinCode] = useState("");
+  const [relayUrl, setRelayUrl] = useState("ws://127.0.0.1:8785");
+  const [lobbyNotice, setLobbyNotice] = useState<string | null>(null);
+
   // Persona edit state
   const [personaDraft, setPersonaDraft] = useState<PersonaProfile | null>(null);
 
@@ -141,10 +147,64 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
     }
   };
 
+  const loadLobby = async () => {
+    try {
+      const res = await fetch("/api/lobby/status");
+      if (res.ok) {
+        const d = await res.json();
+        setLobby(d);
+        if (d.relay_url) setRelayUrl(d.relay_url);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   useEffect(() => {
     if (tab === "rag") loadMemories(ragQuery || undefined);
     if (tab === "receipts") loadReceipts();
+    if (tab === "systems") loadLobby();
   }, [tab, refreshTick]);
+
+  const createEncryptedLobby = async () => {
+    const res = await fetch("/api/lobby/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ relay_url: relayUrl.trim() || null }),
+    });
+    if (res.ok) {
+      const d = await res.json();
+      setLobby(d);
+      setLobbyNotice("Encrypted squad lobby active — share your invite code with your buddy!");
+    }
+  };
+
+  const joinEncryptedLobby = async () => {
+    if (!joinCode.trim()) return;
+    const res = await fetch("/api/lobby/join", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ invite_code: joinCode.trim(), relay_url: relayUrl.trim() || null }),
+    });
+    if (res.ok) {
+      const d = await res.json();
+      if (d.error) {
+        setLobbyNotice(d.error);
+      } else {
+        setLobby(d);
+        setJoinCode("");
+        setLobbyNotice("Joined encrypted squad lobby — syncing game states only (zero chat).");
+      }
+    }
+  };
+
+  const leaveEncryptedLobby = async () => {
+    const res = await fetch("/api/lobby/leave", { method: "POST" });
+    if (res.ok) {
+      setLobby(await res.json());
+      setLobbyNotice("Disconnected from encrypted squad lobby and wiped local session key.");
+    }
+  };
 
   const addMemory = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -312,6 +372,96 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
             </div>
 
             <div className="card">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <div className="card-title" style={{ marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                  <ShieldCheck size={13} color="#5eead4" /> Encrypted Squad Lobby (Game State Only)
+                </div>
+                <span style={{ fontSize: 10, fontWeight: 700, color: lobby?.active ? "#5eead4" : "var(--text-muted)" }}>
+                  {lobby?.active ? `E2E ACTIVE · ${lobby.peer_count || 0} PEERS` : "OFFLINE"}
+                </span>
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.45, marginBottom: 10 }}>
+                AES-256-GCM end-to-end encrypted lobby. Shares <strong>only</strong> ship/vital states (shields, hull,
+                ammo, health, location, threats) — <strong>zero</strong> chat, voice, or AI prompts ever leave your PC.
+              </div>
+
+              {lobby?.active ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 8,
+                      padding: "8px 10px",
+                      borderRadius: 8,
+                      background: "rgba(4, 24, 28, 0.72)",
+                      border: "1px solid rgba(94, 234, 212, 0.28)",
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontSize: 9.5, color: "var(--teal-dim)", letterSpacing: "0.12em" }}>
+                        INVITE &amp; ENCRYPTION CODE
+                      </div>
+                      <div style={{ fontFamily: "Consolas, monospace", fontSize: 14, fontWeight: 700, color: "var(--teal-bright)", letterSpacing: "0.1em" }}>
+                        {lobby.invite_code}
+                      </div>
+                    </div>
+                    <button
+                      className="btn active"
+                      onClick={() => {
+                        navigator.clipboard?.writeText(lobby.invite_code);
+                        setLobbyNotice("Copied invite code to clipboard!");
+                      }}
+                    >
+                      <Copy size={12} /> Copy
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 10.5, color: "var(--teal-dim)" }}>
+                    Relay: <code>{lobby.relay_url}</code> · Sent: {lobby.packets_sent} · Recv: {lobby.packets_received} ·
+                    Rejected: {lobby.packets_rejected}
+                  </div>
+                  {lobby.peers?.length > 0 && (
+                    <div style={{ fontSize: 11, color: "var(--text-main)" }}>
+                      <Users size={11} style={{ marginRight: 5 }} />
+                      Connected: {lobby.peers.map((p: any) => `${p.callsign} (${p.zone})`).join(", ")}
+                    </div>
+                  )}
+                  <button className="btn danger" onClick={leaveEncryptedLobby}>
+                    LEAVE LOBBY &amp; WIPE KEY
+                  </button>
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div className="field-group" style={{ marginBottom: 2 }}>
+                    <label>Lobby Relay Endpoint (LAN, Tailscale, or Tunnel URL)</label>
+                    <input
+                      className="text-input"
+                      value={relayUrl}
+                      onChange={(e) => setRelayUrl(e.target.value)}
+                      placeholder="ws://127.0.0.1:8785 or wss://your-relay.example.com"
+                    />
+                  </div>
+                  <button className="btn active" style={{ justifyContent: "center" }} onClick={createEncryptedLobby}>
+                    CREATE ENCRYPTED LOBBY (GENERATE CODE)
+                  </button>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <input
+                      className="text-input"
+                      value={joinCode}
+                      onChange={(e) => setJoinCode(e.target.value)}
+                      placeholder="Paste buddy's AETHER-XXXX-XXXX-XXXX code..."
+                    />
+                    <button className="btn" onClick={joinEncryptedLobby}>
+                      JOIN
+                    </button>
+                  </div>
+                </div>
+              )}
+              {lobbyNotice && <div style={{ fontSize: 11, color: "#6ee7b7", marginTop: 8 }}>{lobbyNotice}</div>}
+            </div>
+
+            <div className="card">
               <div className="card-title">Proactive Threat &amp; Trigger Scenarios (Demo)</div>
               <div className="toggle-grid">
                 <button className="btn danger" onClick={() => onTriggerScenario("incoming_missile")}>
@@ -320,11 +470,11 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                 <button className="btn amber" onClick={() => onTriggerScenario("radar_lock")}>
                   RADAR LOCK
                 </button>
+                <button className="btn danger" onClick={() => onTriggerScenario("ally_critical")}>
+                  BUDDY CRITICAL / NO AMMO
+                </button>
                 <button className="btn danger" onClick={() => onTriggerScenario("combat_ambush")}>
                   PIRATE AMBUSH
-                </button>
-                <button className="btn danger" onClick={() => onTriggerScenario("ally_distress")}>
-                  ALLY DISTRESS
                 </button>
                 <button className="btn amber" onClick={() => onTriggerScenario("low_fuel")}>
                   LOW H2 FUEL

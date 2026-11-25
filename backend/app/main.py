@@ -16,6 +16,11 @@ from pydantic import BaseModel
 from .config import AetherConfig, PersonaProfile
 from .integrations.spotify import SpotifyConnector
 from .llm.router import LLMRouter
+from .network.lobby import (
+    EncryptedLobbyClient,
+    EncryptedLobbyRelayHub,
+    SquadStatePacket,
+)
 from .rag.compiler import PromptCompiler
 from .rag.embeddings import embed_via_player2
 from .rag.store import MemoryStore
@@ -82,6 +87,15 @@ class MoodSetRequest(BaseModel):
     mood: str = "CALM"
 
 
+class LobbyCreateRequest(BaseModel):
+    relay_url: str | None = None
+
+
+class LobbyJoinRequest(BaseModel):
+    invite_code: str
+    relay_url: str | None = None
+
+
 class ConfigUpdateRequest(BaseModel):
     llm_provider: str | None = None
     player2_base_url: str | None = None
@@ -119,6 +133,11 @@ class AetherRuntime:
         self.spotify = SpotifyConnector(self.config)
         self.voice = VoiceEngine(self.config)
         self.llm = LLMRouter(self.config, self.store, self.executor, spotify=self.spotify, voice=self.voice)
+        self.lobby_hub = EncryptedLobbyRelayHub()
+        self.lobby_client = EncryptedLobbyClient(
+            get_local_packet=self._build_local_squad_packet,
+            on_peer_state=self._on_encrypted_peer_state,
+        )
 
         self.recent_history: list[dict[str, str]] = []
         self._turns_since_distill: int = 0
@@ -132,6 +151,45 @@ class AetherRuntime:
         self.last_calibration: dict[str, Any] | None = None
 
         self.executor.set_dispatch_handler(self._dispatch_game_action)
+
+    def _build_local_squad_packet(self, peer_id: str) -> SquadStatePacket:
+        """Export strictly numeric/enum Star Citizen game state for encrypted lobby sharing (ZERO chat/persona)."""
+        s = self.simulator.ship
+        min_sh = min(s.shields.front, s.shields.back, s.shields.left, s.shields.right)
+        status = (
+            "DISTRESS"
+            if (s.under_fire or s.incoming_missiles or s.vitals.health_pct < 30.0)
+            else ("QUANTUM" if (s.master_mode == "NAV" or s.quantum_spooling or s.in_quantum) else "PATROL")
+        )
+        return SquadStatePacket(
+            peer_id=peer_id,
+            callsign=self.config.pilot_callsign or "CMDR-01",
+            pilot_name=self.config.persona.pilot_name or "Pilot",
+            ship_name=self.config.ship_name or "Star Citizen Vessel",
+            ship_class="Multi-Crew",
+            squad="Lobby",
+            role="PILOT",
+            planet=s.planet,
+            zone=s.zone,
+            shields_pct=round(min_sh, 1),
+            hull_pct=round(s.hull_pct, 1),
+            fuel_pct=round(s.hydrogen_fuel_pct, 1),
+            ammo_pct=round(s.ammo_pct, 1),
+            health_pct=round(s.vitals.health_pct, 1),
+            oxygen_pct=round(s.vitals.oxygen_pct, 1),
+            master_mode=s.master_mode,
+            status=status,
+            under_fire=s.under_fire,
+            radar_locked=bool(s.radar_locks),
+            incoming_missile=bool(s.incoming_missiles),
+            incapacitated=s.vitals.health_pct <= 0.0,
+        )
+
+    def _on_encrypted_peer_state(self, pkt: SquadStatePacket) -> None:
+        """Ingest a decrypted, schema-verified buddy game-state packet into our live 3D fleet & TriggerEngine."""
+        payload = pkt.model_dump()
+        payload["relay_source"] = "encrypted_lobby"
+        self.simulator.upsert_relay_ally(payload)
 
     def _dispatch_game_action(self, action_id: str, params: dict[str, Any]) -> tuple[bool, str]:
         if self.config.telemetry_mode == "grpc":
@@ -170,6 +228,7 @@ class AetherRuntime:
             pass
 
     async def stop_background_tasks(self) -> None:
+        await self.lobby_client.leave_lobby()
         for task in (self._telemetry_task, self._heartbeat_task, self._game_link_task):
             if task:
                 task.cancel()
@@ -892,3 +951,48 @@ async def ws_fleet_relay(ws: WebSocket) -> None:
             await ws.send_text(json.dumps({"ack": True, "callsign": ally.callsign}))
     except WebSocketDisconnect:
         pass
+
+
+@app.get("/api/lobby/status")
+def lobby_status() -> dict[str, Any]:
+    return runtime.lobby_client.status_dict()
+
+
+@app.post("/api/lobby/create")
+async def lobby_create(req: LobbyCreateRequest) -> dict[str, Any]:
+    return await runtime.lobby_client.create_lobby(relay_url=req.relay_url)
+
+
+@app.post("/api/lobby/join")
+async def lobby_join(req: LobbyJoinRequest) -> dict[str, Any]:
+    try:
+        return await runtime.lobby_client.join_lobby(req.invite_code, relay_url=req.relay_url, role="member")
+    except ValueError as exc:
+        return {"active": False, "error": str(exc)}
+
+
+@app.post("/api/lobby/leave")
+async def lobby_leave() -> dict[str, Any]:
+    return await runtime.lobby_client.leave_lobby()
+
+
+@app.websocket("/ws/lobby/{room_token}")
+async def ws_encrypted_lobby(ws: WebSocket, room_token: str) -> None:
+    """Zero-knowledge encrypted lobby relay: forwards opaque AES-256-GCM blobs only; never sees keys or plaintext."""
+    clean_token = "".join(ch for ch in room_token if ch.isalnum())[:32]
+    if len(clean_token) < 16:
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    joined = await runtime.lobby_hub.join(clean_token, ws)
+    if not joined:
+        await ws.close(code=1013)
+        return
+    try:
+        while True:
+            raw_blob = await ws.receive_text()
+            await runtime.lobby_hub.forward_opaque(clean_token, ws, raw_blob)
+    except WebSocketDisconnect:
+        runtime.lobby_hub.leave(clean_token, ws)
+    except Exception:
+        runtime.lobby_hub.leave(clean_token, ws)
