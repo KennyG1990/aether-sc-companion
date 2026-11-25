@@ -370,7 +370,7 @@ class MemoryStore:
         allowed_scopes: tuple[str, ...] = ("private", "fleet", "public"),
         domains: tuple[str, ...] | None = None,
         top_k: int = 6,
-        min_vector_score: float = 0.14,
+        min_vector_score: float = 0.22,
         rrf_k: int = 30,
     ) -> list[RetrievedMemory]:
         """Hard-authorized hybrid BM25 (FTS5) + Semantic Cosine RRF retrieval with abstention floor."""

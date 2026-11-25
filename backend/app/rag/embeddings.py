@@ -11,7 +11,7 @@ import hashlib
 import math
 import re
 
-VECTOR_DIM = 192
+VECTOR_DIM = 512
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]+")
 

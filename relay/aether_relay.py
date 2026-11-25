@@ -51,7 +51,7 @@ async def run_relay(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AETHER Star Citizen Fleet Relay Client")
-    parser.add_argument("--hub", default="ws://127.0.0.1:8765/ws/fleet", help="AETHER C2 Hub WebSocket URL")
+    parser.add_argument("--hub", default="ws://127.0.0.1:8785/ws/fleet", help="AETHER C2 Hub WebSocket URL")
     parser.add_argument("--callsign", required=True, help="Your callsign on the C2 hologram")
     parser.add_argument("--pilot", default="", help="Optional pilot name")
     parser.add_argument("--ship", default="Anvil F7C Hornet", help="Current Star Citizen vessel")

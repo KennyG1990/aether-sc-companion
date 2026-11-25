@@ -77,6 +77,7 @@ export default function App() {
   ]);
 
   const recognitionRef = useRef<any>(null);
+  const seenEventIdsRef = useRef<Set<string>>(new Set());
 
   const speak = (text: string) => {
     if (!ttsEnabled || typeof window === "undefined" || !("speechSynthesis" in window)) return;
@@ -113,15 +114,21 @@ export default function App() {
     const wsUrl = `${proto}://${window.location.host}/ws/telemetry`;
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
+    let disposed = false;
 
     const connect = () => {
+      if (disposed) return;
       ws = new WebSocket(wsUrl);
-      ws.onopen = () => setWsConnected(true);
+      ws.onopen = () => {
+        if (!disposed) setWsConnected(true);
+      };
       ws.onclose = () => {
+        if (disposed) return;
         setWsConnected(false);
         reconnectTimer = window.setTimeout(connect, 1800);
       };
       ws.onmessage = (ev) => {
+        if (disposed) return;
         try {
           const data = JSON.parse(ev.data);
           if (data.type === "telemetry_frame") {
@@ -129,13 +136,20 @@ export default function App() {
             setFleet(data.fleet || []);
             setPendingConfirmations(data.pending_confirmations || []);
 
-            if (data.ship?.alert_level === "COMBAT") {
+            const level = data.ship?.alert_level;
+            if (level === "COMBAT") {
               setMood("COMBAT");
-            } else if (data.ship?.alert_level === "CAUTION") {
+            } else if (level === "CAUTION") {
               setMood("CAUTION");
+            } else if (level === "NOMINAL") {
+              setMood((prev) => (prev === "COMBAT" || prev === "CAUTION" ? "NOMINAL" : prev));
             }
 
-            const events: TelemetryEvent[] = data.events || [];
+            const events: TelemetryEvent[] = (data.events || []).filter((evt: TelemetryEvent) => {
+              if (seenEventIdsRef.current.has(evt.event_id)) return false;
+              seenEventIdsRef.current.add(evt.event_id);
+              return true;
+            });
             if (events.length > 0) {
               events.forEach((evt) => {
                 setMessages((prev) => [
@@ -160,6 +174,7 @@ export default function App() {
 
     connect();
     return () => {
+      disposed = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
     };
@@ -215,7 +230,7 @@ export default function App() {
         {
           id: `err-${Date.now()}`,
           role: "alert",
-          content: "Backend unreachable on port 8765. Start uvicorn app.main:app to connect AETHER.",
+          content: "Backend unreachable on port 8785. Start uvicorn app.main:app --port 8785 to connect AETHER.",
           timestamp: Date.now(),
         },
       ]);

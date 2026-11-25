@@ -235,6 +235,7 @@ body {
   left: 12px;
   right: 12px;
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 10px;
   pointer-events: none;
@@ -451,6 +452,7 @@ body {
 }
 
 .safety-banner {
+  flex-shrink: 0;
   margin: 8px 10px 0;
   padding: 9px 10px;
   border-radius: 8px;

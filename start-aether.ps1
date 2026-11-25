@@ -11,7 +11,7 @@ if (-not (Test-Path $venvPython)) {
     & $venvPython -m pip install -r (Join-Path $backendDir "requirements.txt")
 }
 
-Start-Process pwsh -ArgumentList "-NoExit", "-Command", "cd '$backendDir'; & '$venvPython' -m uvicorn app.main:app --reload --port 8765"
+Start-Process pwsh -ArgumentList "-NoExit", "-Command", "cd '$backendDir'; & '$venvPython' -m uvicorn app.main:app --reload --port 8785"
 
 Write-Host "=== Booting AETHER Holographic C2 Frontend (Vite + React + Three.js) ===" -ForegroundColor Cyan
 $frontendDir = Join-Path $PSScriptRoot "frontend"
