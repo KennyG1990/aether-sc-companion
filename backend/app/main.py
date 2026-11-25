@@ -17,6 +17,7 @@ from .config import AetherConfig, PersonaProfile
 from .integrations.spotify import SpotifyConnector
 from .llm.router import LLMRouter
 from .rag.compiler import PromptCompiler
+from .rag.embeddings import embed_via_player2
 from .rag.store import MemoryStore
 from .telemetry.actions import ActionExecutor
 from .telemetry.grpc_bridge import StarCitizenGrpcBridge
@@ -107,6 +108,7 @@ class AetherRuntime:
         self.voice = VoiceEngine(self.config)
 
         self.recent_history: list[dict[str, str]] = []
+        self._turns_since_distill: int = 0
         self.ui_clients: set[WebSocket] = set()
         self._telemetry_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -122,6 +124,32 @@ class AetherRuntime:
     async def start_background_tasks(self) -> None:
         self._telemetry_task = asyncio.create_task(self._telemetry_loop())
         self._heartbeat_task = asyncio.create_task(self._player2_heartbeat_loop())
+        # Kick off one quiet background embedding pass so seeded memories get dense Player2 vectors
+        asyncio.create_task(self._background_embed_pass())
+
+    async def _background_embed_pass(self) -> None:
+        try:
+            await self.store.embed_pending_via_player2(
+                self.config.player2_base_url,
+                self.config.player2_game_key,
+            )
+        except Exception:
+            pass
+
+    async def _background_distill_episode(self, turns_snapshot: list[dict[str, str]]) -> None:
+        try:
+            prose = await self.llm.distill_episode_prose(turns_snapshot)
+            if prose:
+                self.store.add_memory(
+                    content=prose,
+                    domain="episodic",
+                    truth_class="model_summary",
+                    provenance="auto_episode_distiller",
+                    scope="private",
+                )
+            await self._background_embed_pass()
+        except Exception:
+            pass
 
     async def stop_background_tasks(self) -> None:
         for task in (self._telemetry_task, self._heartbeat_task):
@@ -547,6 +575,19 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     fleet_list = [a.model_dump() for a in runtime.simulator.allies.values()]
     actions = runtime.executor.list_triggerable_actions()
 
+    # Single query-time dense semantic embedding via Player2 /v1/embeddings (offline fallback automatic)
+    dense_q_vec: list[float] | None = None
+    dense_model_id: str | None = None
+    if runtime.config.llm_provider == "player2" or runtime.voice.heartbeat_state.get("last_ok"):
+        emb_res = await embed_via_player2(
+            [req.message],
+            runtime.config.player2_base_url,
+            runtime.config.player2_game_key,
+        )
+        if emb_res:
+            dense_q_vec = emb_res[0][0]
+            dense_model_id = emb_res[1]
+
     compiled = runtime.compiler.compile(
         user_utterance=req.message,
         telemetry_snapshot=ship_dict,
@@ -556,6 +597,8 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         pilot_callsign=runtime.config.pilot_callsign,
         ship_name=runtime.config.ship_name,
         persona=runtime.config.persona,
+        dense_query_vec=dense_q_vec,
+        dense_model_id=dense_model_id,
     )
 
     result = await runtime.llm.respond(
@@ -567,7 +610,20 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
     runtime.recent_history.append({"role": "user", "content": compiled.user_message})
     runtime.recent_history.append({"role": "assistant", "content": result["reply"]})
-    runtime.recent_history = runtime.recent_history[-16:]
+    runtime._turns_since_distill += 2
+
+    # Full-history Conversation RAG (aic_history.lua): archive trimmed turns instead of deleting!
+    if len(runtime.recent_history) > 8:
+        overflow = runtime.recent_history[:-8]
+        runtime.recent_history = runtime.recent_history[-8:]
+        runtime.store.archive_turns(overflow)
+
+    # Automatic background prose memory distillation & dense embedding off the reply path (aic_memory.lua)
+    if runtime._turns_since_distill >= 6:
+        runtime._turns_since_distill = 0
+        asyncio.create_task(runtime._background_distill_episode(list(runtime.recent_history[-6:])))
+    else:
+        asyncio.create_task(runtime._background_embed_pass())
 
     return {
         **result,
@@ -586,6 +642,7 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
             }
             for m in compiled.retrieved_memories
         ],
+        "retrieved_history_count": len(compiled.retrieved_history),
         "pending_confirmations": runtime.executor.list_pending(),
     }
 

@@ -1,4 +1,12 @@
-"""SQLite + FTS5 BM25 + Semantic Vector RRF Hybrid Memory Store (SPEC-912 / #884)."""
+"""SQLite + FTS5 BM25 + Semantic Vector RRF Hybrid Memory & Full-History Conversation Archive.
+
+Modeled directly on x4_AiLive (aic_history.lua + aic_memory.lua + SPEC-416 v2 + SPEC-912 / #884):
+- Memories are stored in natural human prose (never raw wire code blocks).
+- Trimmed conversation turns are archived in 6-line chunks (`conversation_chunks`) instead of deleted,
+  embedded asynchronously off the reply path via Player2 /v1/embeddings (with 512d local fallback).
+- Hybrid BM25 + Dense Cosine fused via Reciprocal Rank Fusion (k=60), injected oldest-first with
+  strict hard scope filtering before scoring and minimum relevance abstention floors.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .embeddings import cosine_similarity, embed_text
+from .embeddings import LOCAL_MODEL_ID, cosine_similarity, embed_text, embed_via_player2
 from .sanitizer import sanitize_untrusted_text
 
 VALID_TRUTH_CLASSES = {
@@ -24,6 +32,30 @@ VALID_TRUTH_CLASSES = {
 }
 
 VALID_SCOPES = {"private", "fleet", "public"}
+HISTORY_CHUNK_LINES = 6
+
+
+def receipt_to_prose(action_id: str, status: str, reason: str) -> str:
+    """Convert raw Transition Authority receipts into clean prose (aic_memory.lua #839 rule)."""
+    clean_reason = reason.strip().rstrip(".")
+    verb_map = {
+        "toggle_landing_gear": "landing gear",
+        "set_master_mode_scm": "SCM combat mode",
+        "set_master_mode_nav": "NAV transit mode",
+        "toggle_lights": "exterior ship lights",
+        "toggle_vtol": "VTOL thrusters",
+        "toggle_doors": "exterior ship doors",
+        "request_landing": "ATC landing clearance",
+        "spool_quantum": "quantum drive spooling",
+        "eject": "emergency ejection",
+        "self_destruct": "ship self-destruct",
+    }
+    label = verb_map.get(action_id, action_id.replace("_", " ").replace(":", " "))
+    if status == "CONFIRMED":
+        return f"The commander executed {label}: {clean_reason}."
+    if status == "REJECTED":
+        return f"An attempted {label} action was cancelled or refused ({clean_reason})."
+    return f"An attempted {label} action could not be completed ({clean_reason})."
 
 
 @dataclass
@@ -43,13 +75,23 @@ class RetrievedMemory:
     rrf_score: float
 
 
+@dataclass
+class RetrievedHistoryChunk:
+    id: str
+    chunk_index: int
+    content: str
+    created_at: float
+    rrf_score: float
+
+
 class MemoryStore:
-    """Persistent SQLite memory store implementing hybrid BM25 + vector RRF retrieval."""
+    """Persistent SQLite memory + full-history conversation RAG store."""
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._pending_history_lines: list[str] = []
         self._init_schema()
         self._seed_initial_knowledge()
 
@@ -72,13 +114,31 @@ class MemoryStore:
                 learned_at REAL NOT NULL,
                 superseded_by TEXT DEFAULT NULL,
                 injection_flagged INTEGER NOT NULL DEFAULT 0,
-                embedding_json TEXT DEFAULT NULL
+                embedding_json TEXT DEFAULT NULL,
+                embedding_model_id TEXT DEFAULT NULL,
+                dense_embedding_json TEXT DEFAULT NULL
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 id UNINDEXED,
                 semantic_key,
                 domain,
+                content,
+                tokenize='porter unicode61'
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_chunks (
+                id TEXT PRIMARY KEY,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                embedding_json TEXT DEFAULT NULL,
+                embedding_model_id TEXT DEFAULT NULL,
+                dense_embedding_json TEXT DEFAULT NULL
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS conversation_chunks_fts USING fts5(
+                id UNINDEXED,
                 content,
                 tokenize='porter unicode61'
             );
@@ -102,6 +162,12 @@ class MemoryStore:
             );
             """
         )
+        # Non-destructive column migration for existing DBs
+        existing_cols = {row["name"] for row in cur.execute("PRAGMA table_info(memories)").fetchall()}
+        if "embedding_model_id" not in existing_cols:
+            cur.execute("ALTER TABLE memories ADD COLUMN embedding_model_id TEXT DEFAULT NULL")
+        if "dense_embedding_json" not in existing_cols:
+            cur.execute("ALTER TABLE memories ADD COLUMN dense_embedding_json TEXT DEFAULT NULL")
         self.conn.commit()
 
     def _seed_initial_knowledge(self) -> None:
@@ -130,15 +196,6 @@ class MemoryStore:
                 1.0,
             ),
             (
-                "lore.telemetry_api",
-                "lore",
-                "lore_canon",
-                "aether_system_manual",
-                "public",
-                "AETHER reads live Star Citizen telemetry via local gRPC on 127.0.0.1:2942 (GameTelemetryService) and executes verified commands through TriggerGameActions. Destructive commands like eject or self_destruct always require pilot confirmation.",
-                1.0,
-            ),
-            (
                 "fleet.callsign.vanguard",
                 "fleet",
                 "firsthand_observation",
@@ -160,7 +217,7 @@ class MemoryStore:
                 "episodic.joke.elevator",
                 "episodic",
                 "firsthand_observation",
-                "aether_banter_bank",
+                "crew_banter",
                 "private",
                 "Running crew joke: The most lethal apex predator in the Stanton system is not a Vanduul Kingship — it is a Grim HEX elevator with an attitude.",
                 0.9,
@@ -199,10 +256,9 @@ class MemoryStore:
         mem_id = f"mem_{uuid.uuid4().hex[:10]}"
         sem_key = semantic_key or f"{domain}.{uuid.uuid4().hex[:8]}"
         occ = occurred_at if occurred_at is not None else now
-        vec = embed_text(sanitized.cleaned)
+        local_vec = embed_text(sanitized.cleaned)
 
         cur = self.conn.cursor()
-        # Supersede prior record with the exact same semantic_key so newer facts win
         cur.execute(
             "UPDATE memories SET superseded_by = ? WHERE semantic_key = ? AND superseded_by IS NULL",
             (mem_id, sem_key),
@@ -212,8 +268,8 @@ class MemoryStore:
             INSERT INTO memories (
                 id, semantic_key, domain, truth_class, provenance, scope,
                 content, confidence, occurred_at, learned_at, superseded_by,
-                injection_flagged, embedding_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                injection_flagged, embedding_json, embedding_model_id, dense_embedding_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)
             """,
             (
                 mem_id,
@@ -227,7 +283,8 @@ class MemoryStore:
                 float(occ),
                 now,
                 1 if sanitized.flagged else 0,
-                json.dumps(vec),
+                json.dumps(local_vec),
+                LOCAL_MODEL_ID,
             ),
         )
         cur.execute(
@@ -260,6 +317,177 @@ class MemoryStore:
             "learned_at": now,
         }
 
+    # --- Full-History Conversation RAG Archive (aic_history.lua) ---
+
+    def archive_turns(self, turns: list[dict[str, str]]) -> int:
+        """Archive trimmed conversation turns into 6-line searchable chunks instead of deleting them."""
+        new_chunks = 0
+        for turn in turns:
+            text = sanitize_untrusted_text(turn.get("content", ""), max_len=260).cleaned
+            if not text:
+                continue
+            who = "Commander" if turn.get("role") == "user" else "You"
+            self._pending_history_lines.append(f"{who}: {text}")
+
+        while len(self._pending_history_lines) >= HISTORY_CHUNK_LINES:
+            block_lines = self._pending_history_lines[:HISTORY_CHUNK_LINES]
+            self._pending_history_lines = self._pending_history_lines[HISTORY_CHUNK_LINES:]
+            chunk_text = "\n".join(block_lines)
+            chunk_id = f"hist_{uuid.uuid4().hex[:10]}"
+            now = time.time()
+            row = self.conn.execute("SELECT COALESCE(MAX(chunk_index), 0) AS mx FROM conversation_chunks").fetchone()
+            next_idx = int(row["mx"]) + 1
+            local_vec = embed_text(chunk_text)
+            self.conn.execute(
+                """
+                INSERT INTO conversation_chunks (id, chunk_index, content, created_at, embedding_json, embedding_model_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, next_idx, chunk_text, now, json.dumps(local_vec), LOCAL_MODEL_ID),
+            )
+            self.conn.execute(
+                "INSERT INTO conversation_chunks_fts (id, content) VALUES (?, ?)",
+                (chunk_id, chunk_text),
+            )
+            new_chunks += 1
+        if new_chunks:
+            self.conn.commit()
+        return new_chunks
+
+    async def embed_pending_via_player2(self, base_url: str, game_key: str) -> int:
+        """Background task (off reply path): upgrade unembedded memories & history chunks with dense Player2 vectors."""
+        embedded_total = 0
+
+        # 1. Memories lacking dense Player2 vector
+        mem_rows = self.conn.execute(
+            "SELECT id, content FROM memories WHERE superseded_by IS NULL AND dense_embedding_json IS NULL LIMIT 25"
+        ).fetchall()
+        if mem_rows:
+            res = await embed_via_player2([r["content"] for r in mem_rows], base_url, game_key)
+            if res:
+                vecs, model_id = res
+                for r, v in zip(mem_rows, vecs):
+                    self.conn.execute(
+                        "UPDATE memories SET dense_embedding_json = ?, embedding_model_id = ? WHERE id = ?",
+                        (json.dumps(v), model_id, r["id"]),
+                    )
+                self.conn.commit()
+                embedded_total += len(vecs)
+
+        # 2. Conversation history chunks lacking dense Player2 vector
+        hist_rows = self.conn.execute(
+            "SELECT id, content FROM conversation_chunks WHERE dense_embedding_json IS NULL LIMIT 25"
+        ).fetchall()
+        if hist_rows:
+            res = await embed_via_player2([r["content"] for r in hist_rows], base_url, game_key)
+            if res:
+                vecs, model_id = res
+                for r, v in zip(hist_rows, vecs):
+                    self.conn.execute(
+                        "UPDATE conversation_chunks SET dense_embedding_json = ?, embedding_model_id = ? WHERE id = ?",
+                        (json.dumps(v), model_id, r["id"]),
+                    )
+                self.conn.commit()
+                embedded_total += len(vecs)
+
+        return embedded_total
+
+    def search_history_chunks(
+        self,
+        query: str,
+        dense_query_vec: list[float] | None = None,
+        dense_model_id: str | None = None,
+        top_k: int = 4,
+        rrf_k: int = 60,
+    ) -> list[RetrievedHistoryChunk]:
+        """Hybrid BM25 + Dense/Local Cosine RRF over archived 6-line conversation chunks (oldest-first!)."""
+        if not query.strip():
+            return []
+
+        rows = self.conn.execute("SELECT * FROM conversation_chunks ORDER BY chunk_index ASC").fetchall()
+        chunks: list[dict[str, Any]] = [dict(r) for r in rows]
+
+        # Index-lag protection (aic_history.lua line 310): include unchunked pending lines too!
+        if self._pending_history_lines:
+            chunks.append(
+                {
+                    "id": "hist_pending",
+                    "chunk_index": 999999,
+                    "content": "\n".join(self._pending_history_lines),
+                    "created_at": time.time(),
+                    "embedding_json": json.dumps(embed_text("\n".join(self._pending_history_lines))),
+                    "dense_embedding_json": None,
+                    "embedding_model_id": LOCAL_MODEL_ID,
+                }
+            )
+        if not chunks:
+            return []
+
+        by_id = {c["id"]: c for c in chunks}
+
+        # 1. BM25 via FTS5
+        fts_tokens = [t for t in re.findall(r"[a-zA-Z0-9_]+", query) if len(t) > 2]
+        bm25_ranks: dict[str, int] = {}
+        if fts_tokens:
+            fts_expr = " OR ".join(f'"{t}"' for t in fts_tokens[:12])
+            try:
+                fts_rows = self.conn.execute(
+                    """
+                    SELECT id, bm25(conversation_chunks_fts) AS rank_score
+                    FROM conversation_chunks_fts
+                    WHERE conversation_chunks_fts MATCH ?
+                    ORDER BY rank_score ASC
+                    LIMIT 20
+                    """,
+                    (fts_expr,),
+                ).fetchall()
+                for idx, fr in enumerate(fts_rows):
+                    if fr["id"] in by_id:
+                        bm25_ranks[fr["id"]] = idx + 1
+            except sqlite3.OperationalError:
+                pass
+
+        # 2. Semantic Cosine (prefer dense Player2 vectors when model matches, else local 512d)
+        local_q = embed_text(query)
+        vec_scores: dict[str, float] = {}
+        for cid, c in by_id.items():
+            if dense_query_vec and dense_model_id and c.get("dense_embedding_json") and c.get("embedding_model_id") == dense_model_id:
+                sc = cosine_similarity(dense_query_vec, json.loads(c["dense_embedding_json"]))
+                if sc >= 0.30:
+                    vec_scores[cid] = sc
+            elif c.get("embedding_json"):
+                sc = cosine_similarity(local_q, json.loads(c["embedding_json"]))
+                if sc >= 0.24:
+                    vec_scores[cid] = sc
+
+        vec_ranks = {
+            cid: idx + 1
+            for idx, (cid, _) in enumerate(sorted(vec_scores.items(), key=lambda kv: kv[1], reverse=True))
+        }
+
+        scored: list[RetrievedHistoryChunk] = []
+        for cid, c in by_id.items():
+            b_rank = bm25_ranks.get(cid)
+            v_rank = vec_ranks.get(cid)
+            if b_rank is None and v_rank is None:
+                continue
+            rrf = (1.0 / (rrf_k + b_rank) if b_rank else 0.0) + (1.0 / (rrf_k + v_rank) if v_rank else 0.0)
+            scored.append(
+                RetrievedHistoryChunk(
+                    id=cid,
+                    chunk_index=int(c["chunk_index"]),
+                    content=c["content"],
+                    created_at=float(c["created_at"]),
+                    rrf_score=round(rrf, 6),
+                )
+            )
+
+        scored.sort(key=lambda x: x.rrf_score, reverse=True)
+        picked = scored[:top_k]
+        # Chronological oldest-first order per aic_history.lua so later excerpts supersede earlier ones!
+        picked.sort(key=lambda x: x.chunk_index)
+        return picked
+
     def record_receipt(
         self,
         action_id: str,
@@ -279,10 +507,10 @@ class MemoryStore:
         )
         self.conn.commit()
 
-        # Store confirmed/rejected receipts in episodic memory with authoritative truth_class
+        # Store in natural prose (aic_memory.lua #839 — never ugly wire syntax!)
         if status in ("CONFIRMED", "REJECTED", "FAILED"):
             self.add_memory(
-                content=f"Action {action_id} ({status}): {reason}",
+                content=receipt_to_prose(action_id, status, reason),
                 domain="receipt",
                 truth_class="committed_receipt",
                 provenance="transition_authority",
@@ -359,6 +587,7 @@ class MemoryStore:
                 "confidence": r["confidence"],
                 "occurred_at": r["occurred_at"],
                 "learned_at": r["learned_at"],
+                "embedding_model_id": r["embedding_model_id"],
                 "injection_flagged": bool(r["injection_flagged"]),
             }
             for r in rows
@@ -371,9 +600,11 @@ class MemoryStore:
         domains: tuple[str, ...] | None = None,
         top_k: int = 6,
         min_vector_score: float = 0.22,
-        rrf_k: int = 30,
+        rrf_k: int = 60,
+        dense_query_vec: list[float] | None = None,
+        dense_model_id: str | None = None,
     ) -> list[RetrievedMemory]:
-        """Hard-authorized hybrid BM25 (FTS5) + Semantic Cosine RRF retrieval with abstention floor."""
+        """Hard-authorized hybrid BM25 (FTS5) + Dense/Local Semantic Cosine RRF retrieval with abstention floor."""
         if not query.strip():
             return []
 
@@ -385,7 +616,6 @@ class MemoryStore:
             domain_clause = f" AND domain IN ({domain_placeholders})"
             params.extend(domains)
 
-        # 1. Hard Authorization Filter BEFORE scoring (SPEC-912 §4.4 / §5.2)
         rows = self.conn.execute(
             f"""
             SELECT * FROM memories
@@ -400,7 +630,7 @@ class MemoryStore:
 
         authorized_by_id = {r["id"]: r for r in rows}
 
-        # 2. Lexical BM25 via SQLite FTS5
+        # 1. Lexical BM25 via SQLite FTS5
         fts_tokens = [t for t in re.findall(r"[a-zA-Z0-9_]+", query) if len(t) > 1]
         bm25_ranks: dict[str, int] = {}
         if fts_tokens:
@@ -424,20 +654,34 @@ class MemoryStore:
             except sqlite3.OperationalError:
                 pass
 
-        # 3. Semantic Cosine Similarity
+        # 2. Semantic Cosine Similarity (use Player2 dense embedding when model matches, else local 512d)
         q_vec = embed_text(query)
         vec_scores: dict[str, float] = {}
+        vec_thresholds: dict[str, float] = {}
         for mem_id, row in authorized_by_id.items():
-            emb_raw = row["embedding_json"]
-            if emb_raw:
-                vec_scores[mem_id] = cosine_similarity(q_vec, json.loads(emb_raw))
+            if (
+                dense_query_vec
+                and dense_model_id
+                and row["dense_embedding_json"]
+                and row["embedding_model_id"] == dense_model_id
+            ):
+                vec_scores[mem_id] = cosine_similarity(dense_query_vec, json.loads(row["dense_embedding_json"]))
+                vec_thresholds[mem_id] = 0.28
+            elif row["embedding_json"]:
+                vec_scores[mem_id] = cosine_similarity(q_vec, json.loads(row["embedding_json"]))
+                vec_thresholds[mem_id] = min_vector_score
             else:
                 vec_scores[mem_id] = 0.0
+                vec_thresholds[mem_id] = min_vector_score
 
         sorted_vec = sorted(vec_scores.items(), key=lambda kv: kv[1], reverse=True)
-        vec_ranks = {mem_id: idx + 1 for idx, (mem_id, sc) in enumerate(sorted_vec) if sc >= min_vector_score}
+        vec_ranks = {
+            mem_id: idx + 1
+            for idx, (mem_id, sc) in enumerate(sorted_vec)
+            if sc >= vec_thresholds.get(mem_id, min_vector_score)
+        }
 
-        # 4. Reciprocal Rank Fusion (RRF) + Minimum Relevance Floor (Abstain below floor)
+        # 3. Reciprocal Rank Fusion (RRF k=60 per aic_history.lua) + Abstention Floor
         candidates: list[RetrievedMemory] = []
         seen_keys: set[str] = set()
         now = time.time()
@@ -447,20 +691,15 @@ class MemoryStore:
             v_rank = vec_ranks.get(mem_id)
             v_score = vec_scores.get(mem_id, 0.0)
 
-            # Abstain if neither lexical BM25 matched nor semantic floor was met (#884 gap #7)
             if b_rank is None and v_rank is None:
                 continue
 
-            rrf = 0.0
-            if b_rank is not None:
-                rrf += 1.0 / (rrf_k + b_rank)
-            if v_rank is not None:
-                rrf += 1.0 / (rrf_k + v_rank)
-
-            # Mild index-lag/recency bonus for memories learned within the last 10 minutes
+            rrf = (1.0 / (rrf_k + b_rank) if b_rank is not None else 0.0) + (
+                1.0 / (rrf_k + v_rank) if v_rank is not None else 0.0
+            )
             age_sec = max(0.0, now - float(row["learned_at"]))
             if age_sec < 600:
-                rrf += 0.004 * (1.0 - age_sec / 600.0)
+                rrf += 0.002 * (1.0 - age_sec / 600.0)
 
             candidates.append(
                 RetrievedMemory(
@@ -482,7 +721,6 @@ class MemoryStore:
 
         candidates.sort(key=lambda m: m.rrf_score, reverse=True)
 
-        # 5. Deduplicate by semantic_key
         deduped: list[RetrievedMemory] = []
         for item in candidates:
             if item.semantic_key in seen_keys:

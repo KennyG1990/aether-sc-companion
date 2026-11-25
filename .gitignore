@@ -18,6 +18,8 @@ frontend/.vite/
 .env
 .env.local
 *.key
+backend/data/aether_settings.json
+backend/data/*.json
 
 # IDE & OS
 .vscode/

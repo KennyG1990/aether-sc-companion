@@ -389,6 +389,66 @@ class LLMRouter:
 
         return profile, greeting
 
+    async def distill_episode_prose(self, turns: list[dict[str, str]]) -> str | None:
+        """Background episode distiller (modeled on x4_AiLive aic_memory.lua MemEpisode).
+
+        Turns a slice of conversation into ONE clean first-person past-tense prose sentence
+        preserving names, ships, places, and outcomes — no lists, no brackets, no code syntax.
+        """
+        if not turns:
+            return None
+        p = self.config.persona
+        lines = []
+        for t in turns[-6:]:
+            who = p.pilot_name if t.get("role") == "user" else p.ai_name
+            lines.append(f"{who}: {t.get('content', '').strip()[:240]}")
+
+        prompt = (
+            f"Below is a short exchange between {p.pilot_name} and {p.ai_name}. "
+            f"Write ONE concise sentence in {p.ai_name}'s voice (first person, past tense) summarizing what mattered — "
+            "any facts learned, ships, friends, jokes, preferences, or orders executed. "
+            "Plain natural prose only. No lists, no brackets, no technical codes. Reply with the single sentence only.\n\n"
+            + "\n".join(lines)
+        )
+        try:
+            if self.config.llm_provider == "player2":
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    r = await client.post(
+                        f"{self.config.player2_base_url.rstrip('/')}/v1/chat/completions",
+                        headers=self._player2_chat_headers("memory-distill"),
+                        json={
+                            "messages": [{"role": "system", "content": prompt}],
+                            "stream": False,
+                            "temperature": 0.3,
+                        },
+                    )
+                    if r.status_code == 200:
+                        txt = (r.json()["choices"][0]["message"].get("content") or "").strip().strip('"')
+                        if 12 <= len(txt) <= 320 and "[" not in txt and "{" not in txt:
+                            return txt
+            elif self.config.llm_provider == "openrouter" and self.config.openrouter_api_key:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    r = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.config.openrouter_api_key}",
+                        },
+                        json={
+                            "model": self.config.openrouter_model,
+                            "messages": [{"role": "system", "content": prompt}],
+                            "temperature": 0.3,
+                            "max_tokens": 120,
+                        },
+                    )
+                    if r.status_code == 200:
+                        txt = (r.json()["choices"][0]["message"].get("content") or "").strip().strip('"')
+                        if 12 <= len(txt) <= 320 and "[" not in txt and "{" not in txt:
+                            return txt
+        except Exception:
+            pass
+        return None
+
     async def _call_openai_compat(
         self,
         base_url: str,

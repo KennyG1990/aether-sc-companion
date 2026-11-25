@@ -5,20 +5,19 @@ interface JarvisCore3DProps {
   mood: string; // NOMINAL | CAUTION | COMBAT | HUMOR | CALIBRATING
   speaking: boolean;
   listening: boolean;
-  aiName: string;
   audioLevelRef: React.MutableRefObject<number>;
   audioFreqRef: React.MutableRefObject<Uint8Array | null>;
+  showReflection?: boolean;
 }
 
-const MOOD_PALETTES: Record<string, { primary: number; rim: number; bg: string }> = {
-  NOMINAL: { primary: 0x14b8a6, rim: 0x5eead4, bg: "radial-gradient(circle at 50% 48%, rgba(20,184,166,0.22) 0%, rgba(4,16,22,0.92) 66%, rgba(2,8,14,1) 100%)" },
-  CAUTION: { primary: 0xd97706, rim: 0xfcd34d, bg: "radial-gradient(circle at 50% 48%, rgba(245,158,11,0.22) 0%, rgba(20,14,6,0.92) 66%, rgba(8,6,4,1) 100%)" },
-  COMBAT: { primary: 0xdc2626, rim: 0xfca5a5, bg: "radial-gradient(circle at 50% 48%, rgba(239,68,68,0.24) 0%, rgba(24,6,10,0.92) 66%, rgba(10,3,5,1) 100%)" },
-  HUMOR: { primary: 0x9333ea, rim: 0xd8b4fe, bg: "radial-gradient(circle at 50% 48%, rgba(168,85,247,0.22) 0%, rgba(16,8,28,0.92) 66%, rgba(6,4,14,1) 100%)" },
-  CALIBRATING: { primary: 0x0ea5e9, rim: 0x67e8f9, bg: "radial-gradient(circle at 50% 48%, rgba(56,189,248,0.24) 0%, rgba(4,16,28,0.92) 66%, rgba(2,8,16,1) 100%)" },
+const MOOD_PALETTES: Record<string, { primary: number; rim: number }> = {
+  NOMINAL: { primary: 0x14b8a6, rim: 0x5eead4 },
+  CAUTION: { primary: 0xd97706, rim: 0xfcd34d },
+  COMBAT: { primary: 0xdc2626, rim: 0xfca5a5 },
+  HUMOR: { primary: 0x9333ea, rim: 0xd8b4fe },
+  CALIBRATING: { primary: 0x0ea5e9, rim: 0x67e8f9 },
 };
 
-// Shared 3D Ashima simplex noise + harmonic acoustic wave displacement GLSL snippet
 const NOISE_GLSL = /* glsl */ `
 vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x, 289.0);}
 vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
@@ -77,22 +76,19 @@ float computeOrbDisplacement(
   vec3 uSpikeDir2,
   float uLayerOffset
 ) {
-  // 1. Organic bubbling waves going smoothly in and out
   float bubble1 = snoise(dir * 2.15 + vec3(uTime * 0.42 + uLayerOffset, -uTime * 0.34, uTime * 0.28));
   float bubble2 = snoise(dir * 4.4 - vec3(uTime * 0.65, uTime * 0.52 + uLayerOffset, -uTime * 0.41));
   float idleWave = bubble1 * 0.095 + bubble2 * 0.036;
 
-  // 2. Traveling exterior sound-wave ripple across the rim when talking
   float angleWave = sin(atan(dir.y, dir.x) * 9.0 + uTime * 11.0 + uLayerOffset * 2.0) *
                     cos(dir.z * 6.0 - uTime * 7.5);
-  float rimVibration = angleWave * (0.015 + uMid * 0.085 + uTreble * 0.055);
+  float rimVibration = angleWave * (0.014 + uMid * 0.09 + uTreble * 0.06);
 
-  // 3. Localized vocal spikes erupting outward at dynamic focal locations while speaking
   float focus1 = pow(max(0.0, dot(dir, normalize(uSpikeDir1))), 5.0);
   float focus2 = pow(max(0.0, dot(dir, normalize(uSpikeDir2))), 6.0);
   float fineRipple = 0.65 + 0.35 * snoise(dir * 7.5 + vec3(uTime * 3.8));
-  float localizedSpike = (focus1 * (0.34 * uVoiceAmp + 0.14 * uBass) +
-                          focus2 * (0.24 * uVoiceAmp + 0.12 * uTreble)) * fineRipple;
+  float localizedSpike = (focus1 * (0.36 * uVoiceAmp + 0.16 * uBass) +
+                          focus2 * (0.26 * uVoiceAmp + 0.14 * uTreble)) * fineRipple;
 
   return idleWave * (1.0 + uVoiceAmp * 0.65) + rimVibration + localizedSpike;
 }
@@ -122,7 +118,6 @@ void main() {
     dir, uTime, uVoiceAmp, uBass, uMid, uTreble, uSpikeDir1, uSpikeDir2, uLayerOffset
   ) * uDispScale;
 
-  // Approximate perturbed normal via finite differences along tangent frame for crisp Fresnel contour
   vec3 up = abs(dir.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
   vec3 t1 = normalize(cross(up, dir));
   vec3 t2 = cross(dir, t1);
@@ -171,16 +166,13 @@ void main() {
   vec3 N = normalize(vNormalView);
   float ndotv = abs(dot(N, V));
 
-  // Razor-luminous exterior contour with transparent misty interior
   float fresnel = pow(1.0 - ndotv, uRimPower);
-  float innerMist = pow(1.0 - ndotv, 1.4) * 0.18;
+  float innerMist = pow(1.0 - ndotv, 1.45) * 0.16;
 
-  // Fine holographic stipple grain along the membrane silhouette (matching reference texture)
   float grain = hash31(floor(vLocalDir * 68.0 + vec3(floor(uTime * 4.0) * 0.13)));
   float stipple = mix(0.76, 1.26, grain);
 
-  // Brighten spikes where sound waves push outward
-  float spikeGlow = smoothstep(0.04, 0.24, vDisp) * (0.45 + uVoiceAmp * 0.75);
+  float spikeGlow = smoothstep(0.04, 0.24, vDisp) * (0.45 + uVoiceAmp * 0.78);
 
   vec3 col = mix(uPrimaryColor, uRimColor, clamp(fresnel * 1.15 + spikeGlow, 0.0, 1.0));
   float alpha = clamp((fresnel * 0.95 + innerMist + spikeGlow * 0.35) * stipple * uOpacity, 0.0, 1.0);
@@ -235,21 +227,18 @@ void main() {
 `;
 
 /**
- * Bioluminescent Bubbling Acoustic Orb AI Core (inspired by user's uploaded teal energy orb):
- * - Dual Fresnel bubbling outer energy membranes + matching stippled particle shell
- * - Localized vocal spike eruptions & rim sound-wave vibrations synced to ElevenLabs Web Audio FFT
- * - Delicate middle scalloped wave-petal halo
- * - Inner rotating latitude/longitude dotted core sphere
+ * Floating Bioluminescent Bubbling Acoustic Orb with optional live blurred obsidian-floor reflection.
  */
 export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
   mood,
   speaking,
   listening,
-  aiName,
   audioLevelRef,
   audioFreqRef,
+  showReflection = false,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
+  const reflectCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef({ mood, speaking, listening });
 
   useEffect(() => {
@@ -260,14 +249,18 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
     const container = mountRef.current;
     if (!container) return;
 
-    const width = container.clientWidth || 320;
-    const height = container.clientHeight || 260;
+    const width = container.clientWidth || 380;
+    const height = container.clientHeight || 380;
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 100);
     camera.position.set(0, 0, 4.35);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: true,
+      preserveDrawingBuffer: showReflection,
+    });
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     container.innerHTML = "";
@@ -281,7 +274,6 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
     const targetPrimary = new THREE.Color(0x14b8a6);
     const targetRim = new THREE.Color(0x5eead4);
 
-    // Shared reactive shader uniforms
     const makeMembraneUniforms = (layerOffset: number, opacity: number, rimPower: number, dispScale: number) => ({
       uTime: { value: 0 },
       uVoiceAmp: { value: 0 },
@@ -298,37 +290,36 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       uRimPower: { value: rimPower },
     });
 
-    // === 1. OUTER BUBBLING ACOUSTIC MEMBRANE ===
     const outerUniforms = makeMembraneUniforms(0.0, 0.96, 2.85, 1.0);
-    const outerGeo = new THREE.IcosahedronGeometry(1.42, 6);
-    const outerMat = new THREE.ShaderMaterial({
-      uniforms: outerUniforms,
-      vertexShader: MEMBRANE_VERT,
-      fragmentShader: MEMBRANE_FRAG,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-    });
-    const outerShell = new THREE.Mesh(outerGeo, outerMat);
+    const outerShell = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(1.42, 6),
+      new THREE.ShaderMaterial({
+        uniforms: outerUniforms,
+        vertexShader: MEMBRANE_VERT,
+        fragmentShader: MEMBRANE_FRAG,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+      })
+    );
     root.add(outerShell);
 
-    // === 2. SECONDARY NESTED FLUID MEMBRANE (double-rim wave look from reference) ===
     const innerMemUniforms = makeMembraneUniforms(2.4, 0.72, 3.1, 0.85);
-    const innerMemGeo = new THREE.IcosahedronGeometry(1.25, 5);
-    const innerMemMat = new THREE.ShaderMaterial({
-      uniforms: innerMemUniforms,
-      vertexShader: MEMBRANE_VERT,
-      fragmentShader: MEMBRANE_FRAG,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-    });
-    const innerMemShell = new THREE.Mesh(innerMemGeo, innerMemMat);
+    const innerMemShell = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(1.25, 5),
+      new THREE.ShaderMaterial({
+        uniforms: innerMemUniforms,
+        vertexShader: MEMBRANE_VERT,
+        fragmentShader: MEMBRANE_FRAG,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+      })
+    );
     root.add(innerMemShell);
 
-    // === 3. STIPPLED LUMINOUS PARTICLE CRUST ALONG THE OUTER RIM ===
     const crustUniforms = {
       uTime: { value: 0 },
       uVoiceAmp: { value: 0 },
@@ -343,7 +334,6 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
     const crustCount = 1600;
     const crustPositions = new Float32Array(crustCount * 3);
     for (let i = 0; i < crustCount; i++) {
-      // Fibonacci sphere distribution for smooth stipple crust
       const phi = Math.acos(1 - (2 * (i + 0.5)) / crustCount);
       const theta = Math.PI * (1 + Math.sqrt(5)) * i;
       const r = 1.42 + (Math.random() - 0.5) * 0.03;
@@ -353,18 +343,19 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
     }
     const crustGeo = new THREE.BufferGeometry();
     crustGeo.setAttribute("position", new THREE.BufferAttribute(crustPositions, 3));
-    const crustMat = new THREE.ShaderMaterial({
-      uniforms: crustUniforms,
-      vertexShader: RIM_PARTICLE_VERT,
-      fragmentShader: RIM_PARTICLE_FRAG,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
-    const crustPoints = new THREE.Points(crustGeo, crustMat);
+    const crustPoints = new THREE.Points(
+      crustGeo,
+      new THREE.ShaderMaterial({
+        uniforms: crustUniforms,
+        vertexShader: RIM_PARTICLE_VERT,
+        fragmentShader: RIM_PARTICLE_FRAG,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      })
+    );
     root.add(crustPoints);
 
-    // === 4. MIDDLE SCALLOPED WAVE-PETAL HALO RING ===
     const scallopSegments = 180;
     const scallopPts = new Float32Array((scallopSegments + 1) * 3);
     const scallopGeo = new THREE.BufferGeometry();
@@ -375,10 +366,8 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       opacity: 0.28,
       blending: THREE.AdditiveBlending,
     });
-    const scallopRing = new THREE.LineLoop(scallopGeo, scallopMat);
-    root.add(scallopRing);
+    root.add(new THREE.LineLoop(scallopGeo, scallopMat));
 
-    const haloCircleGeo = new THREE.RingGeometry(0.84, 0.855, 72);
     const haloCircleMat = new THREE.MeshBasicMaterial({
       color: 0x2dd4bf,
       transparent: true,
@@ -387,10 +376,8 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
-    const haloCircle = new THREE.Mesh(haloCircleGeo, haloCircleMat);
-    root.add(haloCircle);
+    root.add(new THREE.Mesh(new THREE.RingGeometry(0.84, 0.855, 72), haloCircleMat));
 
-    // === 5. INNER DOTTED MERIDIAN CORE SPHERE (exact dotted globe center) ===
     const coreGroup = new THREE.Group();
     root.add(coreGroup);
 
@@ -417,11 +404,8 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
-    const coreDots = new THREE.Points(coreDotsGeo, coreDotsMat);
-    coreGroup.add(coreDots);
+    coreGroup.add(new THREE.Points(coreDotsGeo, coreDotsMat));
 
-    // Crisp luminous inner core rim ring
-    const coreRimGeo = new THREE.RingGeometry(coreRadius - 0.014, coreRadius + 0.01, 64);
     const coreRimMat = new THREE.MeshBasicMaterial({
       color: 0x5eead4,
       transparent: true,
@@ -430,25 +414,12 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
-    const coreRim = new THREE.Mesh(coreRimGeo, coreRimMat);
+    const coreRim = new THREE.Mesh(new THREE.RingGeometry(coreRadius - 0.014, coreRadius + 0.01, 64), coreRimMat);
     root.add(coreRim);
 
-    // Subtle dark-teal inner glass sphere for depth
-    const coreTint = new THREE.Mesh(
-      new THREE.SphereGeometry(coreRadius - 0.01, 24, 24),
-      new THREE.MeshBasicMaterial({
-        color: 0x0d9488,
-        transparent: true,
-        opacity: 0.14,
-        depthWrite: false,
-      })
-    );
-    coreGroup.add(coreTint);
-
-    // === 6. AMBIENT FLOATING ATMOSPHERIC SPARKS ===
-    const ambientCount = 75;
-    const ambPos = new Float32Array(ambientCount * 3);
-    for (let i = 0; i < ambientCount; i++) {
+    const ambCount = 70;
+    const ambPos = new Float32Array(ambCount * 3);
+    for (let i = 0; i < ambCount; i++) {
       const r = 1.55 + Math.random() * 1.15;
       const th = Math.random() * Math.PI * 2;
       const ph = Math.acos(2 * Math.random() - 1);
@@ -460,16 +431,15 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
     ambGeo.setAttribute("position", new THREE.BufferAttribute(ambPos, 3));
     const ambMat = new THREE.PointsMaterial({
       color: 0x5eead4,
-      size: 0.025,
+      size: 0.024,
       transparent: true,
-      opacity: 0.45,
+      opacity: 0.42,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
     const ambientSparks = new THREE.Points(ambGeo, ambMat);
     root.add(ambientSparks);
 
-    // Smooth animation state for audio reactivity & wandering spike focal locations
     let smoothAmp = 0;
     let smoothBass = 0;
     let smoothMid = 0;
@@ -481,13 +451,14 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
 
     const clock = new THREE.Clock();
     let animId = 0;
+    let frameCount = 0;
 
     const animate = () => {
       animId = requestAnimationFrame(animate);
+      frameCount++;
       const t = clock.getElapsedTime();
       const { mood: m, speaking: isSpeaking, listening: isListening } = stateRef.current;
 
-      // Update palette colors smoothly by mood
       const pal = MOOD_PALETTES[m] || MOOD_PALETTES.NOMINAL;
       targetPrimary.setHex(pal.primary);
       targetRim.setHex(pal.rim);
@@ -498,7 +469,6 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       primaryColor.lerp(targetPrimary, 0.08);
       rimColor.lerp(targetRim, 0.08);
 
-      // Extract real bass / mid / treble energy from ElevenLabs AnalyserNode (or clean fallback when speaking)
       let rawAmp = audioLevelRef.current || 0;
       let rawBass = 0;
       let rawMid = 0;
@@ -516,7 +486,6 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
         rawMid = Math.min(1.0, (mSum / (16 * 255)) * 1.65);
         rawTreble = Math.min(1.0, (tSum / (24 * 255)) * 1.9);
       } else if (isSpeaking) {
-        // Fallback harmonic speech envelope if browser speechSynthesis is used
         rawAmp = 0.35 + Math.abs(Math.sin(t * 11.5)) * 0.45;
         rawBass = 0.3 + Math.abs(Math.sin(t * 7.2)) * 0.4;
         rawMid = 0.35 + Math.abs(Math.cos(t * 14.3)) * 0.45;
@@ -534,14 +503,12 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       smoothMid += (rawMid - smoothMid) * 0.22;
       smoothTreble += (rawTreble - smoothTreble) * 0.22;
 
-      // Move localized speech spike focal points dynamically around the exterior silhouette!
       const wanderSpeed = isSpeaking ? 1.85 + smoothAmp * 2.6 : 0.35;
       spikeAngle1 += 0.016 * wanderSpeed;
       spikeAngle2 -= 0.021 * wanderSpeed;
       spikeDir1.set(Math.cos(spikeAngle1), Math.sin(spikeAngle1), Math.sin(t * 1.4) * 0.28).normalize();
       spikeDir2.set(Math.cos(spikeAngle2), Math.sin(spikeAngle2), Math.cos(t * 1.7) * 0.28).normalize();
 
-      // Update uniforms across outer membrane, nested membrane, and stipple crust
       const updateUniforms = (u: any) => {
         u.uTime.value = t;
         u.uVoiceAmp.value = smoothAmp;
@@ -557,7 +524,6 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       updateUniforms(innerMemUniforms);
       updateUniforms(crustUniforms);
 
-      // Update scalloped wave-petal middle ring dynamically
       const posAttr = scallopGeo.attributes.position as THREE.BufferAttribute;
       const arr = posAttr.array as Float32Array;
       for (let i = 0; i <= scallopSegments; i++) {
@@ -576,8 +542,9 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       coreRimMat.color.copy(rimColor);
       ambMat.color.copy(rimColor);
 
-      // Smooth organic rotation of the bubbling orb & inner dotted globe
       const rotBoost = m === "CALIBRATING" ? 2.6 : isSpeaking ? 1.45 : 1.0;
+      // Gentle levitation float
+      root.position.y = Math.sin(t * 1.45) * 0.06;
       outerShell.rotation.y += 0.0028 * rotBoost;
       outerShell.rotation.x = Math.sin(t * 0.35) * 0.14;
       innerMemShell.rotation.y -= 0.0038 * rotBoost;
@@ -593,14 +560,33 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       ambientSparks.rotation.y -= 0.0018;
 
       renderer.render(scene, camera);
+
+      // Gently mirror the live rendered orb onto the glossy dark obsidian floor underneath
+      if (showReflection && reflectCanvasRef.current && frameCount % 2 === 0) {
+        const rCanvas = reflectCanvasRef.current;
+        const rCtx = rCanvas.getContext("2d");
+        if (rCtx) {
+          const rw = rCanvas.width;
+          const rh = rCanvas.height;
+          const destH = Math.round(rh * 1.48);
+          const originY = Math.round(destH * 0.87 + 4);
+          rCtx.clearRect(0, 0, rw, rh);
+          rCtx.save();
+          rCtx.translate(0, originY);
+          rCtx.scale(1, -1);
+          rCtx.globalAlpha = 0.72;
+          rCtx.drawImage(renderer.domElement, 0, 0, rw, destH);
+          rCtx.restore();
+        }
+      }
     };
 
     animate();
 
     const handleResize = () => {
       if (!container) return;
-      const w = container.clientWidth || 320;
-      const h = container.clientHeight || 260;
+      const w = container.clientWidth || 380;
+      const h = container.clientHeight || 380;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
@@ -612,41 +598,25 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       cancelAnimationFrame(animId);
       renderer.dispose();
     };
-  }, []);
+  }, [showReflection]);
 
-  const palette = MOOD_PALETTES[mood] || MOOD_PALETTES.NOMINAL;
+  if (!showReflection) {
+    return <div ref={mountRef} style={{ width: "100%", height: "100%" }} />;
+  }
 
   return (
-    <div
-      style={{
-        width: "100%",
-        height: "calc(100% - 36px)",
-        position: "relative",
-        background: palette.bg,
-        overflow: "hidden",
-      }}
-    >
-      <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
-      <div
-        style={{
-          position: "absolute",
-          bottom: 6,
-          left: 12,
-          right: 12,
-          display: "flex",
-          justifyContent: "space-between",
-          fontSize: 9.5,
-          letterSpacing: "0.14em",
-          color: "#7ea3c4",
-          textTransform: "uppercase",
-          pointerEvents: "none",
-        }}
-      >
-        <span>
-          {aiName.toUpperCase()} //{" "}
-          {mood === "CALIBRATING" ? "CALIBRATING" : speaking ? "SPEAKING" : listening ? "LISTENING" : mood}
-        </span>
-        <span>ACOUSTIC CORE</span>
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", width: "100%" }}>
+      <div className="orb-hero-wrap">
+        <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
+      </div>
+      <div className="orb-reflection-floor">
+        <div className="orb-floor-sheen" />
+        <canvas
+          ref={reflectCanvasRef}
+          width={420}
+          height={132}
+          style={{ width: "100%", height: "100%", filter: "blur(2.6px)" }}
+        />
       </div>
     </div>
   );

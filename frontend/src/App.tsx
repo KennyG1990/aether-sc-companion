@@ -1,10 +1,25 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Radio, Shield, Cpu, Power, Sparkles, HeartPulse } from "lucide-react";
+import {
+  Settings,
+  Mic,
+  MicOff,
+  Ear,
+  Volume2,
+  VolumeX,
+  Orbit,
+  CircleDot,
+  Send,
+  ShieldAlert,
+  Power,
+  Sparkles,
+  CheckCircle2,
+  AlertTriangle,
+  Loader2,
+} from "lucide-react";
 import { JarvisCore3D } from "./components/JarvisCore3D";
 import { HoloDeck3D } from "./components/HoloDeck3D";
-import { CommsPanel } from "./components/CommsPanel";
-import { InspectorPanel } from "./components/InspectorPanel";
 import { CalibrationOverlay } from "./components/CalibrationOverlay";
+import { SettingsModal } from "./components/SettingsModal";
 import { parseWakeWord } from "./utils/wakeWord";
 import { AetherMicController } from "./utils/voiceCapture";
 import {
@@ -12,7 +27,6 @@ import {
   AllyShipState,
   CalibrationResult,
   CalibrationStep,
-  ChatMessage,
   HeartbeatState,
   PendingConfirmation,
   PersonaProfile,
@@ -70,6 +84,9 @@ const DEFAULT_PERSONA: PersonaProfile = {
 };
 
 export default function App() {
+  const [stageMode, setStageMode] = useState<"core" | "hologram">("core");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
   const [ship, setShip] = useState<ShipTelemetry>(DEFAULT_SHIP);
   const [fleet, setFleet] = useState<AllyShipState[]>([]);
   const [selectedAlly, setSelectedAlly] = useState<AllyShipState | null>(null);
@@ -92,24 +109,17 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
 
-  // Startup Calibration & Personality Interview Modal
-  const [showCalibration, setShowCalibration] = useState(true);
-  const [calibrationMode, setCalibrationMode] = useState<"systems" | "personality">("systems");
+  // Subtle single-line subtitle under the floating orb (no cluttered chat box!)
+  const [subtitle, setSubtitle] = useState<string>("");
+  const [subtitleMeta, setSubtitleMeta] = useState<string>("");
+  const [whisperInput, setWhisperInput] = useState<string>("");
+
+  // Calibration & Personality Interview state
   const [calibrating, setCalibrating] = useState(false);
+  const [hasCalibratedOnce, setHasCalibratedOnce] = useState(false);
   const [calSteps, setCalSteps] = useState<CalibrationStep[]>([]);
   const [calResult, setCalResult] = useState<CalibrationResult | null>(null);
-
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: "boot-1",
-      role: "assistant",
-      content:
-        "Standing by for startup calibration. Click POWER ON & CALIBRATE for live diagnostics, or PERSONALITY SETUP to teach me my name, voice vibe, and how you want me to behave.",
-      mood: "NOMINAL",
-      provider: "system",
-      timestamp: Date.now(),
-    },
-  ]);
+  const [showPersonaModal, setShowPersonaModal] = useState(false);
 
   const micControllerRef = useRef<AetherMicController | null>(null);
   const sendMessageRef = useRef<(text: string) => void>(() => {});
@@ -150,15 +160,8 @@ export default function App() {
       onError: (msg) => {
         setHandsFreeListening(false);
         setListening(false);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `mic-err-${Date.now()}`,
-            role: "alert",
-            content: `[MIC] ${msg}`,
-            timestamp: Date.now(),
-          },
-        ]);
+        setSubtitle(msg);
+        setSubtitleMeta("MICROPHONE");
       },
     });
     micControllerRef.current = controller;
@@ -325,25 +328,24 @@ export default function App() {
         const data: AetherConfigData = await cfgRes.json();
         setConfig(data);
         setTtsEnabled(data.tts_enabled);
-        if (data.player2_status?.heartbeat) {
-          setHeartbeat(data.player2_status.heartbeat);
-        }
+        if (data.player2_status?.heartbeat) setHeartbeat(data.player2_status.heartbeat);
         await refreshVoices(data.tts_provider);
       }
     } catch {
-      // Backend starting up
+      // Backend starting
     }
   };
 
   const runCalibration = async () => {
-    setCalibrationMode("systems");
-    setShowCalibration(true);
+    setStageMode("core");
     setCalibrating(true);
     setCalSteps([]);
     setCalResult(null);
     setMood("CALIBRATING");
+    setSubtitle("Calibrating neural link, voice matrix, and ship telemetry...");
+    setSubtitleMeta("STARTUP DIAGNOSTICS");
 
-    speak("Calibrating. Running neural link, Player2 heartbeat, voice matrix, and ship telemetry diagnostics.");
+    speak("Calibrating. Running neural link, voice matrix, and ship telemetry diagnostics.");
 
     try {
       const res = await fetch("/api/calibrate", { method: "POST" });
@@ -351,17 +353,10 @@ export default function App() {
         const result: CalibrationResult = await res.json();
         setCalResult(result);
         setCalSteps(result.steps || []);
+        setHasCalibratedOnce(true);
         setMood(result.status === "ALL_SYSTEMS_GREEN" ? "NOMINAL" : result.status);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `cal-${Date.now()}`,
-            role: "assistant",
-            content: `[CALIBRATION ${result.status}] ${result.briefing}`,
-            provider: result.provider_used,
-            timestamp: Date.now(),
-          },
-        ]);
+        setSubtitle(result.briefing);
+        setSubtitleMeta(result.status.replace(/_/g, " "));
         speak(result.briefing);
         await fetchConfigAndVoices();
       }
@@ -379,16 +374,8 @@ export default function App() {
     if (res.ok) {
       const data = await res.json();
       await fetchConfigAndVoices();
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `persona-${Date.now()}`,
-          role: "assistant",
-          content: `[PERSONA LOCKED: ${data.persona.ai_name}] ${data.greeting}`,
-          provider: "personality-calibration",
-          timestamp: Date.now(),
-        },
-      ]);
+      setSubtitle(data.greeting);
+      setSubtitleMeta(`PERSONA LOCKED // ${data.persona.ai_name.toUpperCase()}`);
       speak(data.greeting);
       setRefreshTick((t) => t + 1);
     }
@@ -402,7 +389,9 @@ export default function App() {
     });
     if (res.ok) {
       await fetchConfigAndVoices();
-      speak(`Identity matrix updated. Call me ${profile.ai_name}, ${profile.pilot_name}.`);
+      const line = `Identity matrix updated. Call me ${profile.ai_name}, ${profile.pilot_name}.`;
+      setSubtitle(line);
+      speak(line);
       setRefreshTick((t) => t + 1);
     }
   };
@@ -460,22 +449,15 @@ export default function App() {
             });
             if (events.length > 0) {
               events.forEach((evt) => {
-                setMessages((prev) => [
-                  ...prev,
-                  {
-                    id: evt.event_id,
-                    role: "alert",
-                    content: `[PROACTIVE ALERT] ${evt.summary}`,
-                    timestamp: Date.now(),
-                  },
-                ]);
+                setSubtitle(evt.summary);
+                setSubtitleMeta(`ALERT // ${evt.event_type.replace(/_/g, " ")}`);
                 speak(evt.summary);
               });
               setRefreshTick((t) => t + 1);
             }
           }
         } catch {
-          // Ignore malformed frame
+          // ignore
         }
       };
     };
@@ -505,9 +487,7 @@ export default function App() {
     const wakeEnabled = activeCfg?.wake_word_enabled ?? true;
 
     const parsed = parseWakeWord(rawText, aiName, wakeEnabled, wakeWindowRef.current);
-
     if (!parsed.matched) {
-      // Strictly ignore non-addressed chatter (e.g. "Hey John")!
       setLastIgnoredSpeech(rawText);
       return;
     }
@@ -515,34 +495,17 @@ export default function App() {
     setLastIgnoredSpeech(null);
 
     if (parsed.kind === "wake_only") {
-      // User just said "Hey Jarvis" / "Aether" -> greet by configured pilot title & open 15s follow-up window!
       openWakeWindow(15000);
       const reply = `${pilotName}?`;
-      setMessages((prev) => [
-        ...prev,
-        { id: `u-${Date.now()}`, role: "user", content: rawText, timestamp: Date.now() },
-        {
-          id: `w-${Date.now() + 1}`,
-          role: "assistant",
-          content: reply,
-          provider: "wake-word-gate",
-          timestamp: Date.now(),
-        },
-      ]);
+      setSubtitle(reply);
+      setSubtitleMeta(`LISTENING TO ${pilotName.toUpperCase()}`);
       speak(reply);
       return;
     }
 
-    // Valid command addressed to AI -> extend active conversation window briefly and dispatch to LLM
     openWakeWindow(12000);
-    const userMsg: ChatMessage = {
-      id: `u-${Date.now()}`,
-      role: "user",
-      content: rawText,
-      timestamp: Date.now(),
-    };
-    setMessages((prev) => [...prev, userMsg]);
     setBusy(true);
+    setSubtitleMeta(`HEARD: “${parsed.command}”`);
 
     try {
       const res = await fetch("/api/chat", {
@@ -553,32 +516,17 @@ export default function App() {
       const data = await res.json();
       setMood(data.mood || ship.alert_level || "NOMINAL");
       setPendingConfirmations(data.pending_confirmations || []);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `a-${Date.now()}`,
-          role: "assistant",
-          content: data.reply,
-          mood: data.mood,
-          provider: data.provider_used,
-          injectionFlagged: data.injection_flagged,
-          retrieved: data.retrieved_memories,
-          receipts: data.receipts,
-          timestamp: Date.now(),
-        },
-      ]);
+      setSubtitle(data.reply);
+      setSubtitleMeta(
+        data.receipts?.length
+          ? `${data.receipts.map((r: any) => `${r.action_id.replace(/_/g, " ")}: ${r.status}`).join(" · ")}`
+          : `${aiName.toUpperCase()} // ONLINE`
+      );
       speak(data.reply);
       setRefreshTick((t) => t + 1);
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `err-${Date.now()}`,
-          role: "alert",
-          content: "Backend unreachable on port 8785. Start uvicorn app.main:app --port 8785 to connect AETHER.",
-          timestamp: Date.now(),
-        },
-      ]);
+      setSubtitle("Backend link offline on port 8785.");
+      setSubtitleMeta("DISCONNECTED");
     } finally {
       setBusy(false);
     }
@@ -622,16 +570,8 @@ export default function App() {
       body: JSON.stringify({ action_id: actionId }),
     });
     const rcpt = await res.json();
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `act-${Date.now()}`,
-        role: rcpt.status === "CONFIRMED" ? "assistant" : "alert",
-        content: `[${rcpt.status}] ${rcpt.reason}`,
-        receipts: [rcpt],
-        timestamp: Date.now(),
-      },
-    ]);
+    setSubtitle(rcpt.reason);
+    setSubtitleMeta(`${rcpt.action_id.replace(/_/g, " ")} // ${rcpt.status}`);
     speak(rcpt.reason);
     setRefreshTick((t) => t + 1);
   };
@@ -643,16 +583,8 @@ export default function App() {
       body: JSON.stringify({ token, approve }),
     });
     const rcpt = await res.json();
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `cfm-${Date.now()}`,
-        role: rcpt.status === "CONFIRMED" ? "assistant" : "alert",
-        content: `[SAFETY GATE -> ${rcpt.status}] ${rcpt.reason}`,
-        receipts: [rcpt],
-        timestamp: Date.now(),
-      },
-    ]);
+    setSubtitle(rcpt.reason);
+    setSubtitleMeta(`SAFETY GATE // ${rcpt.status}`);
     speak(rcpt.reason);
     setRefreshTick((t) => t + 1);
   };
@@ -664,15 +596,8 @@ export default function App() {
       body: JSON.stringify({ scenario }),
     });
     const data = await res.json();
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `sc-${Date.now()}`,
-        role: scenario === "all_clear" ? "assistant" : "alert",
-        content: `[SIMULATOR] ${data.detail}`,
-        timestamp: Date.now(),
-      },
-    ]);
+    setSubtitle(data.detail);
+    setSubtitleMeta(`SIMULATOR // ${scenario.replace(/_/g, " ").toUpperCase()}`);
   };
 
   const saveConfig = async (patch: Record<string, unknown>) => {
@@ -693,15 +618,277 @@ export default function App() {
     if (res.ok) setHeartbeat(await res.json());
   };
 
+  const submitWhisper = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!whisperInput.trim() || busy) return;
+    void sendMessage(whisperInput.trim());
+    setWhisperInput("");
+  };
+
   const persona = config?.persona || DEFAULT_PERSONA;
-  const alertPillClass =
-    ship.alert_level === "COMBAT" ? "crimson" : ship.alert_level === "CAUTION" ? "amber" : "emerald";
+  const moodClass =
+    mood === "COMBAT"
+      ? "mood-combat"
+      : mood === "CAUTION"
+        ? "mood-caution"
+        : mood === "HUMOR"
+          ? "mood-humor"
+          : "";
+  const dotClass = !wsConnected
+    ? "offline"
+    : ship.alert_level === "COMBAT"
+      ? "combat"
+      : ship.alert_level === "CAUTION"
+        ? "caution"
+        : "";
+
+  const showMicFilament = handsFreeListening || listening || micStatus !== "IDLE";
 
   return (
-    <div className="app-shell">
+    <div className={`stage-shell ${moodClass}`}>
+      {/* Whisper-subtle ambient top-left identity */}
+      <div className="ambient-brand">
+        <span className={`ambient-dot ${dotClass}`} />
+        <div>
+          <div className="ambient-name">{persona.ai_name}</div>
+          <div className="ambient-sub">
+            {speaking
+              ? "Speaking"
+              : listening || wakeWindowActive
+                ? "Listening"
+                : calibrating
+                  ? "Calibrating"
+                  : ship.zone}
+          </div>
+        </div>
+      </div>
+
+      {/* Floating Destructive Safety Gate Pill (only visible when needed) */}
+      {pendingConfirmations.map((p) => (
+        <div key={p.token} className="safety-pill">
+          <ShieldAlert size={15} />
+          <span>
+            Confirm <strong>{p.action_id.replace(/_/g, " ")}</strong>?
+          </span>
+          <button className="btn danger" onClick={() => confirmAction(p.token, true)}>
+            Confirm
+          </button>
+          <button className="btn" onClick={() => confirmAction(p.token, false)}>
+            Abort
+          </button>
+        </div>
+      ))}
+
+      {/* === STAGE 1: PURE FLOATING ACOUSTIC ORB + OBSIDIAN FLOOR REFLECTION === */}
+      {stageMode === "core" && (
+        <div className="orb-center-stage">
+          <JarvisCore3D
+            mood={mood}
+            speaking={speaking}
+            listening={listening || wakeWindowActive}
+            audioLevelRef={audioLevelRef}
+            audioFreqRef={audioFreqRef}
+            showReflection={true}
+          />
+
+          <div className="subtitle-stage">
+            {subtitle ? (
+              <div className="subtitle-text">{subtitle}</div>
+            ) : (
+              <div className="subtitle-text" style={{ color: "rgba(122, 163, 165, 0.72)", fontSize: 14 }}>
+                Say “Hey {persona.ai_name}” or initialize calibration below.
+              </div>
+            )}
+
+            <div className="subtitle-meta">
+              {subtitleMeta && <span>{subtitleMeta}</span>}
+              {lastIgnoredSpeech && !wakeWindowActive && (
+                <span style={{ opacity: 0.65 }}>Ignored: “{lastIgnoredSpeech}”</span>
+              )}
+              {busy && <span style={{ color: "var(--teal-bright)" }}>Thinking...</span>}
+            </div>
+
+            {/* Minimal boot calibration trigger before first calibration */}
+            {!hasCalibratedOnce && !calibrating && (
+              <div className="boot-prompt-row">
+                <button className="btn active" onClick={runCalibration}>
+                  <Power size={12} /> Power On &amp; Calibrate
+                </button>
+                <button className="btn" onClick={() => setShowPersonaModal(true)}>
+                  <Sparkles size={12} /> Personality Setup
+                </button>
+              </div>
+            )}
+
+            {/* Live minimalist diagnostic lines strictly while calibrating */}
+            {calibrating && calSteps.length > 0 && (
+              <div className="cal-live-strip">
+                {calSteps.map((s) => (
+                  <div
+                    key={s.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      fontSize: 11.5,
+                      color: s.status === "OK" ? "#a7f3d0" : s.status === "WARN" ? "#fde68a" : "#7aa3a5",
+                      marginBottom: 4,
+                    }}
+                  >
+                    {s.status === "OK" && <CheckCircle2 size={13} color="#10b981" />}
+                    {s.status === "WARN" && <AlertTriangle size={13} color="#f59e0b" />}
+                    {s.status === "RUNNING" && <Loader2 size={13} color="#2dd4bf" />}
+                    <span style={{ fontWeight: 600 }}>{s.label}</span>
+                    <span style={{ opacity: 0.75, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      — {s.detail}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* === STAGE 2: FULL-VIEWPORT FRIENDS HOLOGRAM + MINI FLOATING CORNER ORB === */}
+      {stageMode === "hologram" && (
+        <>
+          <HoloDeck3D
+            ship={ship}
+            fleet={fleet}
+            selectedAlly={selectedAlly}
+            onSelectAlly={setSelectedAlly}
+          />
+          <div
+            className="orb-corner-pip"
+            onClick={() => setStageMode("core")}
+            title={`Return to ${persona.ai_name} Core`}
+          >
+            <JarvisCore3D
+              mood={mood}
+              speaking={speaking}
+              listening={listening || wakeWindowActive}
+              audioLevelRef={audioLevelRef}
+              audioFreqRef={audioFreqRef}
+              showReflection={false}
+            />
+          </div>
+        </>
+      )}
+
+      {/* Subtle floating mic level filament ONLY when mic is live */}
+      {showMicFilament && (
+        <div className="mic-filament">
+          <span>{micStatus}</span>
+          <div className="bar-track" style={{ width: 90, height: 4 }}>
+            <div
+              className="bar-fill"
+              style={{ width: `${Math.max(6, Math.round(micLevel * 100))}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Minimalist Floating Obsidian Bottom Dock */}
+      <div className="bottom-dock">
+        <button
+          className={`btn ${stageMode === "core" ? "active" : ""}`}
+          onClick={() => setStageMode("core")}
+          title="AI Core Stage"
+        >
+          <CircleDot size={13} /> Core
+        </button>
+        <button
+          className={`btn ${stageMode === "hologram" ? "active" : ""}`}
+          onClick={() => setStageMode("hologram")}
+          title="3D Friends & Fleet Hologram"
+        >
+          <Orbit size={13} /> Hologram
+        </button>
+
+        <div className="dock-divider" />
+
+        <button
+          className={`btn ${handsFreeListening ? "active" : ""}`}
+          onClick={toggleHandsFree}
+          title={`Hands-Free Wake Listening ("Hey ${persona.ai_name}")`}
+        >
+          <Ear size={13} /> {handsFreeListening ? "Wake On" : "Wake"}
+        </button>
+        <button
+          className={`btn ${listening && !handsFreeListening ? "danger" : ""}`}
+          onClick={toggleMic}
+          title="Push-to-Talk (Browser Mic or Player2 Native OS Mic)"
+        >
+          {listening && !handsFreeListening ? <MicOff size={13} /> : <Mic size={13} />}
+          {listening && !handsFreeListening ? "Stop" : "Talk"}
+        </button>
+
+        <div className="dock-divider" />
+
+        <form onSubmit={submitWhisper} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <input
+            className="dock-input"
+            placeholder={
+              config?.wake_word_enabled ?? true
+                ? `Say "Hey ${persona.ai_name}..."`
+                : `Speak to ${persona.ai_name}...`
+            }
+            value={whisperInput}
+            onChange={(e) => setWhisperInput(e.target.value)}
+          />
+          <button className="btn icon-only" type="submit" disabled={busy} title="Send">
+            <Send size={13} />
+          </button>
+        </form>
+
+        <button
+          className={`btn icon-only ${ttsEnabled ? "active" : ""}`}
+          onClick={() => setTtsEnabled((v) => !v)}
+          title={ttsEnabled ? "Mute Voice" : "Unmute Voice"}
+        >
+          {ttsEnabled ? <Volume2 size={13} /> : <VolumeX size={13} />}
+        </button>
+      </div>
+
+      {/* Tiny unobtrusive Settings Gear tucked quietly in bottom-right corner */}
+      <button
+        className="gear-fab"
+        onClick={() => setSettingsOpen(true)}
+        title={`Settings & Diagnostics (Player2 Heartbeat #${heartbeat?.count ?? 0})`}
+        aria-label="Open Settings"
+      >
+        <Settings size={17} />
+        {heartbeat?.last_ok && <span className="gear-hb-dot" />}
+      </button>
+
+      {/* Hidden Settings & Diagnostics Modal (Systems, RAG, Receipts, Persona, Config) */}
+      <SettingsModal
+        visible={settingsOpen}
+        ship={ship}
+        config={config}
+        heartbeat={heartbeat}
+        voices={voices}
+        voicesNote={voicesNote}
+        refreshTick={refreshTick}
+        onClose={() => setSettingsOpen(false)}
+        onStartCalibration={runCalibration}
+        onOpenPersonaInterview={() => setShowPersonaModal(true)}
+        onExecuteAction={executeAction}
+        onTriggerScenario={triggerScenario}
+        onSaveConfig={saveConfig}
+        onSavePersona={handleSavePersonaDirect}
+        onPingHeartbeat={pingHeartbeat}
+        onRefreshVoices={refreshVoices}
+        onTestVoice={() =>
+          speak(`Hello ${persona.pilot_name}. ${persona.ai_name} vocal synthesizer is online and calibrated.`)
+        }
+      />
+
+      {/* Person-to-AI Personality Interview Modal (only shown when invoked) */}
       <CalibrationOverlay
-        visible={showCalibration}
-        initialMode={calibrationMode}
+        visible={showPersonaModal}
+        initialMode="personality"
         calibrating={calibrating}
         steps={calSteps}
         result={calResult}
@@ -709,122 +896,8 @@ export default function App() {
         onStartCalibration={runCalibration}
         onSpeakPrompt={speak}
         onCompletePersonaInterview={handleCompletePersonaInterview}
-        onDismiss={() => setShowCalibration(false)}
+        onDismiss={() => setShowPersonaModal(false)}
       />
-
-      <header className="topbar">
-        <div className="brand">
-          <Cpu size={18} color="#22d3ee" />
-          <div>
-            <div className="brand-title">{persona.ai_name.toUpperCase()}</div>
-            <div className="brand-sub">Star Citizen AI Companion &amp; Holographic C2 Deck</div>
-          </div>
-        </div>
-
-        <div className="status-pills">
-          <button className="btn active" onClick={runCalibration} disabled={calibrating}>
-            <Power size={12} /> {calibrating ? "CALIBRATING..." : "CALIBRATE"}
-          </button>
-          <button
-            className="btn amber"
-            onClick={() => {
-              setCalibrationMode("personality");
-              setShowCalibration(true);
-            }}
-          >
-            <Sparkles size={12} /> PERSONA
-          </button>
-          <span
-            className={`pill ${heartbeat?.last_ok ? "emerald" : "amber"}`}
-            title={`Official Player2 60s Heartbeat | Mod ID: ${config?.player2_game_key || ""}`}
-          >
-            <HeartPulse size={12} /> P2 ♥ #{heartbeat?.count ?? 0}
-          </span>
-          <span className={`pill ${wsConnected ? "emerald" : "crimson"}`}>
-            <Radio size={12} /> 17Hz
-          </span>
-          <span className={`pill ${alertPillClass}`}>
-            <Shield size={12} /> {ship.alert_level}
-          </span>
-          <span className="pill">
-            {(config?.llm_provider || "player2").toUpperCase()} /{" "}
-            {config?.tts_provider === "elevenlabs_direct"
-              ? "OWN 11LABS"
-              : config?.tts_provider === "browser"
-                ? "BROWSER"
-                : "P2 11LABS"}
-          </span>
-        </div>
-      </header>
-
-      <main className="bridge-grid">
-        <div className="left-col">
-          <div className="panel jarvis-box" style={{ height: 300 }}>
-            <div className="panel-header">
-              <span>{persona.ai_name.toUpperCase()} // HOLOGRAM AVATAR</span>
-              <span style={{ fontSize: 10, color: "#7ea3c4" }}>{persona.pilot_name}</span>
-            </div>
-            <JarvisCore3D
-              mood={mood}
-              speaking={speaking}
-              listening={listening || wakeWindowActive}
-              aiName={persona.ai_name}
-              audioLevelRef={audioLevelRef}
-              audioFreqRef={audioFreqRef}
-            />
-          </div>
-
-          <CommsPanel
-            aiName={persona.ai_name}
-            pilotName={persona.pilot_name}
-            wakeWordEnabled={config?.wake_word_enabled ?? true}
-            wakeWindowActive={wakeWindowActive}
-            handsFreeListening={handsFreeListening}
-            micStatus={micStatus}
-            micLevel={micLevel}
-            lastIgnoredSpeech={lastIgnoredSpeech}
-            messages={messages}
-            pendingConfirmations={pendingConfirmations}
-            listening={listening}
-            ttsEnabled={ttsEnabled}
-            busy={busy}
-            onSend={sendMessage}
-            onToggleMic={toggleMic}
-            onToggleHandsFree={toggleHandsFree}
-            onToggleTts={() => setTtsEnabled((v) => !v)}
-            onConfirmAction={confirmAction}
-          />
-        </div>
-
-        <HoloDeck3D
-          ship={ship}
-          fleet={fleet}
-          selectedAlly={selectedAlly}
-          onSelectAlly={setSelectedAlly}
-        />
-
-        <InspectorPanel
-          ship={ship}
-          config={config}
-          heartbeat={heartbeat}
-          voices={voices}
-          voicesNote={voicesNote}
-          onExecuteAction={executeAction}
-          onTriggerScenario={triggerScenario}
-          onSaveConfig={saveConfig}
-          onSavePersona={handleSavePersonaDirect}
-          onOpenPersonaInterview={() => {
-            setCalibrationMode("personality");
-            setShowCalibration(true);
-          }}
-          onPingHeartbeat={pingHeartbeat}
-          onRefreshVoices={refreshVoices}
-          onTestVoice={() =>
-            speak(`Hello ${persona.pilot_name}. ${persona.ai_name} vocal synthesizer is online and calibrated.`)
-          }
-          refreshTick={refreshTick}
-        />
-      </main>
     </div>
   );
 }

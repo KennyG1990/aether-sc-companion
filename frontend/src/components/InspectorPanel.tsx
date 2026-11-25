@@ -44,7 +44,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   onTestVoice,
   refreshTick,
 }) => {
-  const [tab, setTab] = useState<"systems" | "rag" | "receipts" | "persona" | "config">("systems");
+  const [tab, setTab] = useState<"systems" | "rag" | "receipts" | "persona" | "config">("config");
   const [memories, setMemories] = useState<RetrievedMemoryHit[]>([]);
   const [ragQuery, setRagQuery] = useState("");
   const [newMem, setNewMem] = useState("");
@@ -201,26 +201,26 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   const hb = heartbeat || config?.player2_status?.heartbeat || null;
 
   return (
-    <div className="panel" style={{ height: "100%" }}>
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <div className="tabs">
-        <button className={`tab-btn ${tab === "systems" ? "active" : ""}`} onClick={() => setTab("systems")}>
-          Systems
-        </button>
-        <button className={`tab-btn ${tab === "rag" ? "active" : ""}`} onClick={() => setTab("rag")}>
-          RAG
-        </button>
-        <button className={`tab-btn ${tab === "receipts" ? "active" : ""}`} onClick={() => setTab("receipts")}>
-          Receipts
+        <button className={`tab-btn ${tab === "config" ? "active" : ""}`} onClick={() => setTab("config")}>
+          Config
         </button>
         <button className={`tab-btn ${tab === "persona" ? "active" : ""}`} onClick={() => setTab("persona")}>
           Persona
         </button>
-        <button className={`tab-btn ${tab === "config" ? "active" : ""}`} onClick={() => setTab("config")}>
-          Config
+        <button className={`tab-btn ${tab === "systems" ? "active" : ""}`} onClick={() => setTab("systems")}>
+          Ship &amp; Sim
+        </button>
+        <button className={`tab-btn ${tab === "rag" ? "active" : ""}`} onClick={() => setTab("rag")}>
+          Auto-RAG Memory
+        </button>
+        <button className={`tab-btn ${tab === "receipts" ? "active" : ""}`} onClick={() => setTab("receipts")}>
+          Receipts
         </button>
       </div>
 
-      <div className="inspector-body">
+      <div className="modal-body">
         {tab === "systems" && (
           <>
             <div className="card">
