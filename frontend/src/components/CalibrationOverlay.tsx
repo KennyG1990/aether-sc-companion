@@ -1,6 +1,7 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import { CheckCircle2, AlertTriangle, Loader2, Power, Sparkles, Mic, MicOff, ArrowRight } from "lucide-react";
 import { CalibrationResult, CalibrationStep, PersonaProfile } from "../types";
+import { AetherMicController } from "../utils/voiceCapture";
 
 interface CalibrationOverlayProps {
   visible: boolean;
@@ -83,6 +84,7 @@ export const CalibrationOverlay: React.FC<CalibrationOverlayProps> = ({
   });
   const [savingPersona, setSavingPersona] = useState(false);
   const [micActive, setMicActive] = useState(false);
+  const interviewMicRef = useRef<AetherMicController | null>(null);
 
   React.useEffect(() => {
     setMode(initialMode);
@@ -125,31 +127,36 @@ export const CalibrationOverlay: React.FC<CalibrationOverlayProps> = ({
     }
   };
 
-  const dictateAnswer = () => {
-    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRec) return;
-    const rec = new SpeechRec();
-    rec.lang = "en-US";
-    rec.interimResults = false;
-    rec.onstart = () => setMicActive(true);
-    rec.onend = () => setMicActive(false);
-    rec.onerror = () => setMicActive(false);
-    rec.onresult = (ev: any) => {
-      const text = ev.results?.[0]?.[0]?.transcript?.trim();
-      if (!text) return;
-      const curKey = INTERVIEW_QUESTIONS[qIndex].key;
-      if (curKey === "identity") {
-        // Heuristic: if user says "call you Jarvis, call me Captain"
-        const mAi = text.match(/(?:call you|your name is|name you)\s+([a-zA-Z0-9_-]+)/i);
-        const mPilot = text.match(/(?:call me|i am|i'm)\s+([a-zA-Z0-9 _-]+)/i);
-        if (mAi) setAiName(mAi[1]);
-        if (mPilot) setPilotName(mPilot[1]);
-        if (!mAi && !mPilot) setAiName(text.split(/\s+/)[0]);
-      } else {
-        setAnswers((prev) => ({ ...prev, [curKey]: text }));
-      }
-    };
-    rec.start();
+  const dictateAnswer = async () => {
+    if (micActive && interviewMicRef.current) {
+      setMicActive(false);
+      await interviewMicRef.current.stop();
+      return;
+    }
+
+    const curKey = INTERVIEW_QUESTIONS[qIndex].key;
+    const ctrl = new AetherMicController({
+      isAiSpeaking: () => false,
+      onMicLevel: () => {},
+      onStateChange: () => {},
+      onError: () => setMicActive(false),
+      onTranscript: (text) => {
+        const clean = text.trim();
+        if (!clean) return;
+        if (curKey === "identity") {
+          const mAi = clean.match(/(?:call you|your name is|name you)\s+([a-zA-Z0-9_-]+)/i);
+          const mPilot = clean.match(/(?:call me|i am|i'm)\s+([a-zA-Z0-9 _-]+)/i);
+          if (mAi) setAiName(mAi[1]);
+          if (mPilot) setPilotName(mPilot[1]);
+          if (!mAi && !mPilot) setAiName(clean.split(/\s+/)[0]);
+        } else {
+          setAnswers((prev) => ({ ...prev, [curKey]: clean }));
+        }
+      },
+    });
+    interviewMicRef.current = ctrl;
+    const ok = await ctrl.startPushToTalk();
+    setMicActive(ok);
   };
 
   const curQ = INTERVIEW_QUESTIONS[qIndex];

@@ -8,7 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -406,6 +406,26 @@ async def tts_speak(req: SpeakRequest) -> Response:
         media_type="application/json",
         status_code=503,
     )
+
+
+@app.post("/api/stt/transcribe")
+async def stt_transcribe(file: UploadFile = File(...)) -> dict[str, Any]:
+    audio_bytes = await file.read()
+    return await runtime.voice.transcribe_audio(
+        audio_bytes=audio_bytes,
+        filename=file.filename or "speech.wav",
+        content_type=file.content_type or "audio/wav",
+    )
+
+
+@app.post("/api/stt/p2/start")
+async def stt_p2_start() -> dict[str, Any]:
+    return await runtime.voice.start_native_stt(timeout_sec=30.0)
+
+
+@app.post("/api/stt/p2/stop")
+async def stt_p2_stop() -> dict[str, Any]:
+    return await runtime.voice.stop_native_stt()
 
 
 @app.post("/api/calibrate")

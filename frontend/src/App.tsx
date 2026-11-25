@@ -6,6 +6,7 @@ import { CommsPanel } from "./components/CommsPanel";
 import { InspectorPanel } from "./components/InspectorPanel";
 import { CalibrationOverlay } from "./components/CalibrationOverlay";
 import { parseWakeWord } from "./utils/wakeWord";
+import { AetherMicController } from "./utils/voiceCapture";
 import {
   AetherConfigData,
   AllyShipState,
@@ -83,6 +84,8 @@ export default function App() {
   const [speaking, setSpeaking] = useState(false);
   const [listening, setListening] = useState(false);
   const [handsFreeListening, setHandsFreeListening] = useState(false);
+  const [micStatus, setMicStatus] = useState("IDLE");
+  const [micLevel, setMicLevel] = useState(0);
   const [wakeWindowActive, setWakeWindowActive] = useState(false);
   const [lastIgnoredSpeech, setLastIgnoredSpeech] = useState<string | null>(null);
   const [ttsEnabled, setTtsEnabled] = useState(true);
@@ -108,8 +111,8 @@ export default function App() {
     },
   ]);
 
-  const recognitionRef = useRef<any>(null);
-  const handsFreeRef = useRef<boolean>(false);
+  const micControllerRef = useRef<AetherMicController | null>(null);
+  const sendMessageRef = useRef<(text: string) => void>(() => {});
   const seenEventIdsRef = useRef<Set<string>>(new Set());
   const audioLevelRef = useRef<number>(0);
   const audioFreqRef = useRef<Uint8Array | null>(null);
@@ -135,8 +138,34 @@ export default function App() {
   }, [config]);
 
   useEffect(() => {
-    handsFreeRef.current = handsFreeListening;
-  }, [handsFreeListening]);
+    const controller = new AetherMicController({
+      isAiSpeaking: () => ttsPlayingRef.current,
+      onMicLevel: (lvl) => setMicLevel(lvl),
+      onStateChange: (st) => setMicStatus(st),
+      onTranscript: (text) => {
+        if (text.trim()) {
+          sendMessageRef.current(text.trim());
+        }
+      },
+      onError: (msg) => {
+        setHandsFreeListening(false);
+        setListening(false);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `mic-err-${Date.now()}`,
+            role: "alert",
+            content: `[MIC] ${msg}`,
+            timestamp: Date.now(),
+          },
+        ]);
+      },
+    });
+    micControllerRef.current = controller;
+    return () => {
+      void controller.stop();
+    };
+  }, []);
 
   const openWakeWindow = (ms = 15000) => {
     wakeWindowRef.current = true;
@@ -555,79 +584,35 @@ export default function App() {
     }
   };
 
-  const startSpeechRecognizer = (continuous: boolean) => {
-    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRec) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `mic-${Date.now()}`,
-          role: "alert",
-          content: "Web Speech STT is unavailable in this browser. Use Chromium/Edge or type commands below.",
-          timestamp: Date.now(),
-        },
-      ]);
-      return;
-    }
-
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-    }
-
-    const rec = new SpeechRec();
-    rec.lang = "en-US";
-    rec.continuous = continuous;
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
-    rec.onstart = () => setListening(true);
-    rec.onerror = () => {
-      setListening(false);
-    };
-    rec.onend = () => {
-      setListening(false);
-      // Auto-restart in hands-free wake-word mode
-      if (handsFreeRef.current) {
-        window.setTimeout(() => {
-          if (handsFreeRef.current) startSpeechRecognizer(true);
-        }, 400);
-      }
-    };
-    rec.onresult = (event: any) => {
-      const lastResult = event.results?.[event.results.length - 1];
-      if (!lastResult?.isFinal) return;
-      const transcript = lastResult?.[0]?.transcript;
-      if (transcript) void sendMessage(transcript);
-    };
-    recognitionRef.current = rec;
-    rec.start();
+  sendMessageRef.current = (txt: string) => {
+    void sendMessage(txt);
   };
 
-  const toggleMic = () => {
-    if (listening && recognitionRef.current) {
-      setHandsFreeListening(false);
-      handsFreeRef.current = false;
-      recognitionRef.current.stop();
+  const toggleMic = async () => {
+    const ctrl = micControllerRef.current;
+    if (!ctrl) return;
+    if (listening && !handsFreeListening) {
       setListening(false);
+      await ctrl.stop();
       return;
     }
-    startSpeechRecognizer(false);
+    setHandsFreeListening(false);
+    const ok = await ctrl.startPushToTalk();
+    setListening(ok);
   };
 
-  const toggleHandsFree = () => {
+  const toggleHandsFree = async () => {
+    const ctrl = micControllerRef.current;
+    if (!ctrl) return;
     if (handsFreeListening) {
       setHandsFreeListening(false);
-      handsFreeRef.current = false;
-      recognitionRef.current?.stop();
       setListening(false);
-    } else {
-      setHandsFreeListening(true);
-      handsFreeRef.current = true;
-      startSpeechRecognizer(true);
+      await ctrl.stop();
+      return;
     }
+    const ok = await ctrl.startHandsFreeWake();
+    setHandsFreeListening(ok);
+    setListening(ok);
   };
 
   const executeAction = async (actionId: string) => {
@@ -795,6 +780,8 @@ export default function App() {
             wakeWordEnabled={config?.wake_word_enabled ?? true}
             wakeWindowActive={wakeWindowActive}
             handsFreeListening={handsFreeListening}
+            micStatus={micStatus}
+            micLevel={micLevel}
             lastIgnoredSpeech={lastIgnoredSpeech}
             messages={messages}
             pendingConfirmations={pendingConfirmations}

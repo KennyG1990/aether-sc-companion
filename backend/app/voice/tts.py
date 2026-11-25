@@ -234,6 +234,85 @@ class VoiceEngine:
         except Exception as exc:
             return None, f"player2_elevenlabs_error:{exc.__class__.__name__}"
 
+    # --- Player2 Speech-to-Text (Whisper Audio Upload + Native OS Microphone) ---
+
+    async def transcribe_audio(
+        self, audio_bytes: bytes, filename: str = "speech.wav", content_type: str = "audio/wav"
+    ) -> dict[str, Any]:
+        """Transcribe recorded audio via Player2 local Whisper endpoint (/v1/stt/whisper/audio/transcriptions)."""
+        if not audio_bytes or len(audio_bytes) < 400:
+            return {"ok": True, "text": "", "provider": "player2_whisper"}
+
+        base = self.config.player2_base_url.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                resp = await client.post(
+                    f"{base}/v1/stt/whisper/audio/transcriptions",
+                    headers=self._p2_headers("voice-stt"),
+                    files={"file": (filename, audio_bytes, content_type)},
+                    data={"model": "whisper-1", "language": "en"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return {"ok": True, "text": (data.get("text") or "").strip(), "provider": "player2_whisper"}
+                return {
+                    "ok": False,
+                    "text": "",
+                    "error": f"Player2 Whisper HTTP {resp.status_code}: {resp.text[:160]}",
+                    "provider": "player2_whisper",
+                }
+        except Exception as exc:
+            return {"ok": False, "text": "", "error": f"Player2 Whisper unreachable ({exc.__class__.__name__})"}
+
+    async def start_native_stt(self, timeout_sec: float = 30.0, keyterms: list[str] | None = None) -> dict[str, Any]:
+        """Start Player2 App's native OS microphone recording (works even if embedded browser blocks mic)."""
+        base = self.config.player2_base_url.rstrip("/")
+        terms = keyterms or [
+            self.config.persona.ai_name,
+            self.config.persona.pilot_name,
+            "Stanton",
+            "Crusader",
+            "Hurston",
+            "MicroTech",
+            "ArcCorp",
+            "Grim HEX",
+            "Quantum",
+            "Spotify",
+        ]
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(
+                    f"{base}/v1/stt/start",
+                    headers={"Content-Type": "application/json", **self._p2_headers("voice-stt")},
+                    json={"timeout": float(max(3.0, min(60.0, timeout_sec))), "keyterms": [t for t in terms if t][:40]},
+                )
+                if resp.status_code == 200:
+                    data = resp.json() if resp.content else {}
+                    if isinstance(data, dict) and data.get("message"):
+                        return {"ok": False, "error": data["message"]}
+                    return {"ok": True, "provider": "player2_native_mic"}
+                return {"ok": False, "error": f"Player2 native STT HTTP {resp.status_code}: {resp.text[:160]}"}
+        except Exception as exc:
+            return {"ok": False, "error": f"Player2 native STT unreachable ({exc.__class__.__name__})"}
+
+    async def stop_native_stt(self) -> dict[str, Any]:
+        """Stop Player2 App's native OS microphone recording and collect recognized text."""
+        base = self.config.player2_base_url.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    f"{base}/v1/stt/stop",
+                    headers=self._p2_headers("voice-stt"),
+                )
+                if resp.status_code == 200:
+                    data = resp.json() if resp.content else {}
+                    if isinstance(data, dict) and data.get("message") and not data.get("text"):
+                        return {"ok": False, "text": "", "error": data["message"]}
+                    return {"ok": True, "text": (data.get("text") or "").strip(), "provider": "player2_native_mic"}
+                return {"ok": False, "text": "", "error": f"Player2 native STT stop HTTP {resp.status_code}"}
+        except Exception as exc:
+            return {"ok": False, "text": "", "error": f"Player2 native STT stop error ({exc.__class__.__name__})"}
+
     async def probe_player2(self) -> dict[str, Any]:
         """Check live Player2 local API, heartbeat state, Joules, ElevenLabs voices, and MCP server."""
         base = self.config.player2_base_url.rstrip("/")

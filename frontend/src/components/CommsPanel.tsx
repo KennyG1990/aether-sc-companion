@@ -8,6 +8,8 @@ interface CommsPanelProps {
   wakeWordEnabled: boolean;
   wakeWindowActive: boolean;
   handsFreeListening: boolean;
+  micStatus: string;
+  micLevel: number;
   lastIgnoredSpeech: string | null;
   messages: ChatMessage[];
   pendingConfirmations: PendingConfirmation[];
@@ -27,6 +29,8 @@ export const CommsPanel: React.FC<CommsPanelProps> = ({
   wakeWordEnabled,
   wakeWindowActive,
   handsFreeListening,
+  micStatus,
+  micLevel,
   lastIgnoredSpeech,
   messages,
   pendingConfirmations,
@@ -62,6 +66,8 @@ export const CommsPanel: React.FC<CommsPanelProps> = ({
     `Hey ${aiName}, self destruct`,
   ];
 
+  const showMicMeter = handsFreeListening || listening || micStatus !== "IDLE";
+
   return (
     <div className="panel comms-box">
       <div className="panel-header">
@@ -73,21 +79,57 @@ export const CommsPanel: React.FC<CommsPanelProps> = ({
           <button
             className={`btn ${handsFreeListening ? "active" : ""}`}
             onClick={onToggleHandsFree}
-            title={`Hands-Free Wake-Word Listener ("Hey ${aiName}")`}
+            title={`Hands-Free Wake-Word Mic ("Hey ${aiName}") via Player2 Whisper`}
           >
             <Ear size={12} />
             {handsFreeListening ? "WAKE ON" : "WAKE"}
           </button>
           <button
-            className={`btn ${listening ? "danger" : ""}`}
+            className={`btn ${listening && !handsFreeListening ? "danger" : ""}`}
             onClick={onToggleMic}
-            title="Push-to-Talk Speech-to-Text"
+            title="Push-to-Talk (Browser Mic or Player2 Native OS Mic)"
           >
-            {listening ? <MicOff size={12} /> : <Mic size={12} />}
-            {listening ? "STOP" : "TALK"}
+            {listening && !handsFreeListening ? <MicOff size={12} /> : <Mic size={12} />}
+            {listening && !handsFreeListening ? "STOP" : "TALK"}
           </button>
         </div>
       </div>
+
+      {/* Live Mic Level & Whisper STT Status Strip */}
+      {showMicMeter && (
+        <div
+          style={{
+            padding: "5px 10px",
+            fontSize: 10,
+            borderBottom: "1px solid rgba(34, 211, 238, 0.16)",
+            background: "rgba(6, 20, 38, 0.85)",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexShrink: 0,
+          }}
+        >
+          <span
+            style={{
+              color: micStatus.includes("HEARING") || micStatus.includes("RECORDING") ? "#6ee7b7" : "#38bdf8",
+              fontWeight: 700,
+              letterSpacing: "0.08em",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {micStatus}
+          </span>
+          <div className="bar-track" style={{ flex: 1, height: 5 }}>
+            <div
+              className="bar-fill"
+              style={{
+                width: `${Math.max(4, Math.round(micLevel * 100))}%`,
+                background: micLevel > 0.2 ? "linear-gradient(90deg, #10b981, #5eead4)" : "#0ea5e9",
+              }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Wake-Word Gate Status Strip */}
       {wakeWordEnabled && (
@@ -110,7 +152,16 @@ export const CommsPanel: React.FC<CommsPanelProps> = ({
               : `WAKE GATE: Say "Hey ${aiName}" or "${aiName}"`}
           </span>
           {lastIgnoredSpeech && !wakeWindowActive && (
-            <span style={{ color: "#94a3b8", fontStyle: "italic", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 140 }}>
+            <span
+              style={{
+                color: "#94a3b8",
+                fontStyle: "italic",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                maxWidth: 140,
+              }}
+            >
               Ignored: “{lastIgnoredSpeech}”
             </span>
           )}
