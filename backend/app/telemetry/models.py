@@ -24,6 +24,25 @@ class PlayerVitals(BaseModel):
     locomotion: str = "PILOT_SEAT"  # ON_FOOT | PILOT_SEAT | GUNNER | EVA
 
 
+class RadarLockThreat(BaseModel):
+    source_name: str = "Unknown Hostile"
+    bearing_clock: str = "four o'clock high"
+    bearing_deg: float = 120.0
+    distance_m: float = 2800.0
+    closing_speed_mps: float = 240.0
+    lock_type: str = "RADAR"  # RADAR | MISSILE_LOCK
+
+
+class IncomingMissileThreat(BaseModel):
+    missile_id: str = "msl_1"
+    missile_type: str = "IR"  # IR | EM | CS | TORPEDO
+    bearing_clock: str = "five o'clock low"
+    bearing_deg: float = 155.0
+    distance_m: float = 2600.0
+    speed_mps: float = 680.0
+    eta_sec: float = 3.8
+
+
 class ShipTelemetry(BaseModel):
     timestamp: float = Field(default_factory=time.time)
     source: str = "simulator"  # simulator | grpc_live
@@ -48,6 +67,8 @@ class ShipTelemetry(BaseModel):
     quantum_spooling: bool = False
     flight_assist: bool = True
     under_fire: bool = False
+    radar_locks: list[RadarLockThreat] = Field(default_factory=list)
+    incoming_missiles: list[IncomingMissileThreat] = Field(default_factory=list)
     alert_level: str = "NOMINAL"  # NOMINAL | CAUTION | COMBAT
     vitals: PlayerVitals = Field(default_factory=PlayerVitals)
 

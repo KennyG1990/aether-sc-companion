@@ -548,6 +548,29 @@ class MemoryStore:
             for r in rows
         ]
 
+    def list_personality_memories(self, limit: int = 24) -> list[dict[str, Any]]:
+        """Return all active Living Personality memories (domain='personality') in chronological order
+        so they inject directly into Section B of AETHER's core prompt on every single turn."""
+        rows = self.conn.execute(
+            """
+            SELECT id, semantic_key, content, learned_at
+            FROM memories
+            WHERE domain = 'personality' AND superseded_by IS NULL
+            ORDER BY learned_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "semantic_key": r["semantic_key"],
+                "content": r["content"],
+                "learned_at": r["learned_at"],
+            }
+            for r in rows
+        ]
+
     def list_security_audit(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM security_audit ORDER BY created_at DESC LIMIT ?",

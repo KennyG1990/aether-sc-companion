@@ -193,3 +193,51 @@ def test_hologram_director_focuses_friend_and_self(tmp_path: Path) -> None:
     assert cmds[0]["target"] == "Kestrel"
 
 
+def test_living_personality_memory_always_in_prompt_and_shapes_missile_alerts(tmp_path: Path) -> None:
+    from app.telemetry.triggers import TriggerEngine
+
+    store = MemoryStore(str(tmp_path / "persona_live.db"))
+    sim = TelemetrySimulator()
+    executor = ActionExecutor(store)
+    compiler = PromptCompiler(store)
+    triggers = TriggerEngine(cooldown_seconds=1.0)
+
+    # 1. Before plain-speech memory: missile alert includes tactical range & speed
+    sim.trigger_scenario("incoming_missile")
+    ev_tactical = triggers.evaluate(sim.ship, list(sim.allies.values()), personality_memories=[])
+    assert any(e.event_type == "INCOMING_MISSILE" for e in ev_tactical)
+    msl_tac = next(e for e in ev_tactical if e.event_type == "INCOMING_MISSILE")
+    assert "Incoming" in msl_tac.summary and "meters per second" in msl_tac.summary
+
+    # 2. Pilot tells AETHER to speak plainly -> stored in Living Personality memory (NOT a setting!)
+    store.add_memory(
+        content="Speak plainly without raw statistics or percentages — say shields are almost full instead of 90%.",
+        domain="personality",
+        truth_class="user_claim",
+        provenance="pilot_personality",
+    )
+
+    # Even on an unrelated shield query, Living Personality memory MUST be in Section B of the prompt!
+    compiled = compiler.compile(
+        user_utterance="How are my shields?",
+        telemetry_snapshot=sim.ship.model_dump(),
+        fleet_snapshot=[a.model_dump() for a in sim.allies.values()],
+        available_actions=executor.list_triggerable_actions(),
+        recent_history=[],
+        pilot_callsign="CMDR-01",
+        ship_name="UEES Aetherion",
+    )
+    assert "Speak plainly without raw statistics" in compiled.system_prompt
+    assert "INCOMING MISSILES:" in compiled.system_prompt
+
+    # 3. Subsequent missile alert automatically speaks plainly with zero raw statistics!
+    sim.trigger_scenario("incoming_missile")
+    p_mems = [m["content"] for m in store.list_personality_memories()]
+    ev_plain = triggers.evaluate(sim.ship, list(sim.allies.values()), personality_memories=p_mems)
+    msl_plain = next(e for e in ev_plain if e.event_type == "INCOMING_MISSILE")
+    assert msl_plain.summary.startswith("Incoming missile!")
+    assert "meters per second" not in msl_plain.summary
+    assert "%" not in msl_plain.summary
+
+
+

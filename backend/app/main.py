@@ -123,6 +123,8 @@ class AetherRuntime:
         self.recent_history: list[dict[str, str]] = []
         self._turns_since_distill: int = 0
         self.current_mood: str = "CALM"
+        self._personality_cache: list[str] = [m["content"] for m in self.store.list_personality_memories(limit=24)]
+        self._personality_cache_at: float = time.time()
         self.ui_clients: set[WebSocket] = set()
         self._telemetry_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -196,7 +198,22 @@ class AetherRuntime:
     async def _telemetry_loop(self) -> None:
         while True:
             ship, fleet = self.simulator.step()
-            events = self.triggers.evaluate(ship, fleet) if self.config.proactive_alerts_enabled else []
+            now = time.time()
+            if now - self._personality_cache_at >= 2.0:
+                self._personality_cache = [m["content"] for m in self.store.list_personality_memories(limit=24)]
+                self._personality_cache_at = now
+
+            events = (
+                self.triggers.evaluate(
+                    ship,
+                    fleet,
+                    personality_memories=self._personality_cache,
+                    persona_tone=self.config.persona.tone,
+                    pilot_name=self.config.persona.pilot_name,
+                )
+                if self.config.proactive_alerts_enabled
+                else []
+            )
 
             if events:
                 for ev in events:
@@ -630,6 +647,9 @@ def _finalize_chat_turn(compiled: Any, result: dict[str, Any]) -> None:
     runtime.recent_history.append({"role": "user", "content": compiled.user_message})
     runtime.recent_history.append({"role": "assistant", "content": result["reply"]})
     runtime._turns_since_distill += 2
+    if any(m.get("domain") == "personality" for m in (result.get("saved_memories") or [])):
+        runtime._personality_cache = [m["content"] for m in runtime.store.list_personality_memories(limit=24)]
+        runtime._personality_cache_at = time.time()
 
     # Full-history Conversation RAG (aic_history.lua): archive trimmed turns instead of deleting!
     if len(runtime.recent_history) > 8:

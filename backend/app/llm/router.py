@@ -66,15 +66,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save a durable fact, crew note, preference, rule, or running joke into AETHER's SQLite semantic memory.",
+            "description": "Save a durable memory in SQLite. IMPORTANT: Use domain='personality' (NOT control_settings!) whenever the pilot tells you HOW to talk, behave, phrase alerts, speak plainly without statistics, question orders, or evolve your personality — personality memories inject directly into your core prompt permanently!",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "Fact, rule, or memory to remember."},
+                    "content": {"type": "string", "description": "Natural prose statement of the personality trait, rule, fact, or memory."},
                     "domain": {
                         "type": "string",
-                        "enum": ["episodic", "fleet", "preference", "lore"],
-                        "description": "Memory category.",
+                        "enum": ["personality", "episodic", "fleet", "preference", "lore"],
+                        "description": "'personality' for how you speak/behave/warn/interact (goes straight into your core prompt); 'episodic'/'fleet'/'preference'/'lore' for crew & world memories.",
                     },
                     "spoken_reply": _SPOKEN_REPLY_PROP,
                 },
@@ -859,22 +859,55 @@ class LLMRouter:
                 receipts.append(rcpt)
                 tool_out = json.dumps(rcpt)
             elif fn_name == "save_memory":
+                mem_content = str(args.get("content", "")).strip()
+                mem_domain = str(args.get("domain", "episodic")).strip().lower()
+                # Auto-promote behavioral / communication style directives directly into Living Personality!
+                low_c = mem_content.lower()
+                personality_cues = (
+                    "speak ",
+                    "talk ",
+                    "plainly",
+                    "no statistics",
+                    "no stats",
+                    "without statistics",
+                    "don't give me stat",
+                    "question me",
+                    "confirm before",
+                    "call out",
+                    "warn me",
+                    "incoming missile",
+                    "address me",
+                    "be more ",
+                    "be less ",
+                    "tone",
+                    "sarcas",
+                    "blunt",
+                    "casual",
+                    "percentage",
+                )
+                if mem_domain != "personality" and any(cue in low_c for cue in personality_cues):
+                    mem_domain = "personality"
+
                 mem = self.store.add_memory(
-                    content=str(args.get("content", "")),
-                    domain=str(args.get("domain", "episodic")),
+                    content=mem_content,
+                    domain=mem_domain,
                     truth_class="user_claim",
-                    provenance="pilot_voice",
+                    provenance="pilot_personality" if mem_domain == "personality" else "pilot_voice",
                 )
                 saved_memories.append(mem)
                 rcpt = self.store.record_receipt(
-                    action_id="memory:save",
-                    parameters={"domain": mem.get("domain", "episodic")},
+                    action_id="personality:evolve" if mem_domain == "personality" else "memory:save",
+                    parameters={"domain": mem_domain},
                     status="CONFIRMED",
-                    reason=f"Committed to memory: {mem['content'][:110]}",
+                    reason=(
+                        f"Personality updated: {mem['content'][:110]}"
+                        if mem_domain == "personality"
+                        else f"Committed to memory: {mem['content'][:110]}"
+                    ),
                     source=f"{provider_label}_tool",
                 )
                 receipts.append(rcpt)
-                tool_out = json.dumps({"saved": True, "id": mem["id"]})
+                tool_out = json.dumps({"saved": True, "id": mem["id"], "domain": mem_domain})
             elif fn_name == "spotify_control" and self.spotify is not None:
                 sp_cmd = str(args.get("command", "play"))
                 sp_query = str(args.get("query", ""))

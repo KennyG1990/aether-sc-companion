@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 import time
+import uuid
 from typing import Any
 
-from .models import AllyShipState, ShipTelemetry
+from .models import AllyShipState, IncomingMissileThreat, RadarLockThreat, ShipTelemetry
 
 
 class TelemetrySimulator:
@@ -15,7 +16,9 @@ class TelemetrySimulator:
     def __init__(self) -> None:
         self.ship = ShipTelemetry(source="simulator")
         self._start_time = time.time()
+        self._last_step_time = self._start_time
         self._combat_until = 0.0
+        self._lock_until = 0.0
         self.allies: dict[str, AllyShipState] = {
             "Kestrel": AllyShipState(
                 callsign="Kestrel",
@@ -85,6 +88,8 @@ class TelemetrySimulator:
 
     def step(self) -> tuple[ShipTelemetry, list[AllyShipState]]:
         now = time.time()
+        dt = max(0.01, min(0.25, now - self._last_step_time))
+        self._last_step_time = now
         t = now - self._start_time
         self.ship.timestamp = now
 
@@ -125,6 +130,23 @@ class TelemetrySimulator:
                 self.ship.shields.right = max(0.0, round(self.ship.shields.right - 0.8, 1))
             self.ship.vitals.heart_rate_bpm = max(70.0, round(self.ship.vitals.heart_rate_bpm - 0.25, 1))
 
+        # Update active incoming missiles & radar locks in real time
+        if self.ship.incoming_missiles:
+            surviving: list[IncomingMissileThreat] = []
+            for msl in self.ship.incoming_missiles:
+                msl.distance_m = max(0.0, round(msl.distance_m - msl.speed_mps * dt, 1))
+                msl.eta_sec = round(msl.distance_m / max(1.0, msl.speed_mps), 1)
+                if msl.distance_m > 35.0:
+                    surviving.append(msl)
+            self.ship.incoming_missiles = surviving
+
+        if self.ship.radar_locks:
+            if now >= self._lock_until and not self.ship.incoming_missiles:
+                self.ship.radar_locks = []
+            else:
+                for lk in self.ship.radar_locks:
+                    lk.distance_m = max(450.0, round(lk.distance_m - lk.closing_speed_mps * dt * 0.25, 1))
+
         # Derive alert level
         min_shield = min(
             self.ship.shields.front,
@@ -132,9 +154,14 @@ class TelemetrySimulator:
             self.ship.shields.left,
             self.ship.shields.right,
         )
-        if self.ship.under_fire or min_shield < 30.0 or self.ship.vitals.oxygen_pct < 35.0:
+        if (
+            self.ship.under_fire
+            or self.ship.incoming_missiles
+            or min_shield < 30.0
+            or self.ship.vitals.oxygen_pct < 35.0
+        ):
             self.ship.alert_level = "COMBAT"
-        elif self.ship.hydrogen_fuel_pct < 20.0 or min_shield < 60.0:
+        elif self.ship.radar_locks or self.ship.hydrogen_fuel_pct < 20.0 or min_shield < 60.0:
             self.ship.alert_level = "CAUTION"
         else:
             self.ship.alert_level = "NOMINAL"
@@ -209,9 +236,39 @@ class TelemetrySimulator:
                 kestrel.shields_pct = 24.0
                 kestrel.hull_pct = 71.0
             return "Simulated distress beacon from Kestrel (F7A Hornet Mk II) near Grim HEX."
+        if scenario == "radar_lock":
+            self._lock_until = now + 16.0
+            self.ship.radar_locks = [
+                RadarLockThreat(
+                    source_name="Hostile Gladius",
+                    bearing_clock="four o'clock high",
+                    bearing_deg=122.0,
+                    distance_m=2850.0,
+                    closing_speed_mps=245.0,
+                    lock_type="MISSILE_LOCK",
+                )
+            ]
+            return "Simulated radar lock from hostile fighter at four o'clock high (2.8 km)."
+        if scenario == "incoming_missile":
+            self._lock_until = now + 14.0
+            self.ship.incoming_missiles = [
+                IncomingMissileThreat(
+                    missile_id=f"msl_{uuid.uuid4().hex[:6]}",
+                    missile_type="IR",
+                    bearing_clock="five o'clock low",
+                    bearing_deg=152.0,
+                    distance_m=3200.0,
+                    speed_mps=680.0,
+                    eta_sec=4.7,
+                )
+            ]
+            return "Simulated incoming IR missile launched from five o'clock low (3.2 km, 680 m/s)."
         if scenario == "all_clear":
             self._combat_until = 0.0
+            self._lock_until = 0.0
             self.ship.under_fire = False
+            self.ship.radar_locks = []
+            self.ship.incoming_missiles = []
             self.ship.shields.front = 100.0
             self.ship.shields.back = 100.0
             self.ship.shields.left = 100.0

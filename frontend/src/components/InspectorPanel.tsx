@@ -312,8 +312,14 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
             </div>
 
             <div className="card">
-              <div className="card-title">Proactive Trigger Scenarios (Demo)</div>
+              <div className="card-title">Proactive Threat &amp; Trigger Scenarios (Demo)</div>
               <div className="toggle-grid">
+                <button className="btn danger" onClick={() => onTriggerScenario("incoming_missile")}>
+                  INCOMING MISSILE
+                </button>
+                <button className="btn amber" onClick={() => onTriggerScenario("radar_lock")}>
+                  RADAR LOCK
+                </button>
                 <button className="btn danger" onClick={() => onTriggerScenario("combat_ambush")}>
                   PIRATE AMBUSH
                 </button>
