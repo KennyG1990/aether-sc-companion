@@ -14,11 +14,14 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 class AetherConfig(BaseModel):
     llm_provider: str = Field(
-        default=os.getenv("AETHER_LLM_PROVIDER", "demo"),
+        default=os.getenv("AETHER_LLM_PROVIDER", "player2"),
         description="Active LLM backend: 'player2', 'openrouter', or 'demo'.",
     )
     player2_base_url: str = Field(
         default=os.getenv("PLAYER2_BASE_URL", "http://127.0.0.1:4315"),
+    )
+    player2_mcp_url: str = Field(
+        default=os.getenv("PLAYER2_MCP_URL", "http://127.0.0.1:9847/mcp"),
     )
     player2_game_key: str = Field(
         default=os.getenv("PLAYER2_GAME_KEY", "aether-star-citizen"),
@@ -28,6 +31,20 @@ class AetherConfig(BaseModel):
     )
     openrouter_model: str = Field(
         default=os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.7-sonnet"),
+    )
+    tts_provider: str = Field(
+        default=os.getenv("AETHER_TTS_PROVIDER", "player2_elevenlabs"),
+        description="'player2_elevenlabs', 'elevenlabs_direct', or 'browser'.",
+    )
+    elevenlabs_voice_id: str = Field(
+        default=os.getenv("ELEVENLABS_VOICE_ID", "01955d76-ed5b-754f-a070-a570ddfed516"),
+        description="Default Jarvis-style British male voice (Harry on Player2 ElevenLabs).",
+    )
+    elevenlabs_model_id: str = Field(
+        default=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
+    )
+    elevenlabs_api_key: str = Field(
+        default=os.getenv("ELEVENLABS_API_KEY", ""),
     )
     telemetry_mode: str = Field(
         default=os.getenv("AETHER_TELEMETRY_MODE", "simulator"),

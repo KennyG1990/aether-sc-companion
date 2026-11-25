@@ -1,4 +1,4 @@
-"""Unified Decision Authority Router: Player2 Local API <-> OpenRouter <-> Offline Demo."""
+"""Unified Decision Authority Router: Player2 Local API (4315) <-> OpenRouter <-> Offline Demo."""
 
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ class LLMRouter:
                     "Content-Type": "application/json",
                     "player2-game-key": self.config.player2_game_key,
                 },
-                model="player2-default",
+                model=None,  # Per Player2 /v1/openapi.json, Player2 routes using user's selected model
                 provider_label="player2",
                 compiled=compiled,
                 recent_history=recent_history,
@@ -111,11 +111,89 @@ class LLMRouter:
 
         return self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
 
+    async def generate_calibration_briefing(self, diagnostics: dict[str, Any]) -> tuple[str, str]:
+        """Use Player2/OpenRouter LLM to deliver a sharp Jarvis post-calibration ship readiness briefing."""
+        sys_msg = (
+            "You are AETHER, a charismatic, crisp British Jarvis-style ship AI aboard a Star Citizen vessel. "
+            "You have JUST finished your startup calibration sequence. "
+            "Deliver a spoken readiness report in 2 short sentences max (under 35 words) based STRICTLY on the real diagnostic JSON below. "
+            "Mention key real facts (e.g., shields, fuel, fleet count, and whether all systems are green or if Star Citizen gRPC is on simulator link). "
+            "End with 'All systems green, Commander.' if alert_level is NOMINAL, otherwise state the real caution/alert."
+        )
+        user_msg = f"Real calibration diagnostics:\n{json.dumps(diagnostics, indent=2)}"
+
+        provider = self.config.llm_provider.lower()
+        try:
+            if provider == "player2":
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.post(
+                        f"{self.config.player2_base_url.rstrip('/')}/v1/chat/completions",
+                        headers={
+                            "Content-Type": "application/json",
+                            "player2-game-key": self.config.player2_game_key,
+                        },
+                        json={
+                            "messages": [
+                                {"role": "system", "content": sys_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            "stream": False,
+                            "temperature": 0.6,
+                        },
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                    txt = (data["choices"][0]["message"].get("content") or "").strip()
+                    model_name = data.get("model", "player2")
+                    if txt:
+                        return txt, f"player2 ({model_name})"
+            elif provider == "openrouter" and self.config.openrouter_api_key:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.config.openrouter_api_key}",
+                        },
+                        json={
+                            "model": self.config.openrouter_model,
+                            "messages": [
+                                {"role": "system", "content": sys_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            "temperature": 0.6,
+                            "max_tokens": 350,
+                        },
+                    )
+                    r.raise_for_status()
+                    txt = (r.json()["choices"][0]["message"].get("content") or "").strip()
+                    if txt:
+                        return txt, f"openrouter ({self.config.openrouter_model})"
+        except Exception:
+            pass
+
+        # Deterministic real-state fallback
+        ship = diagnostics["ship"]
+        min_sh = diagnostics["min_shield_pct"]
+        fleet_n = diagnostics["fleet_count"]
+        mem_n = diagnostics["memory_count"]
+        if ship["alert_level"] == "NOMINAL":
+            return (
+                f"Calibration complete. Neural link nominal, {mem_n} memories indexed, {fleet_n} allied vessels on the Stanton holo-deck, "
+                f"shields at {min_sh:.0f} percent and hydrogen at {ship['hydrogen_fuel_pct']:.0f} percent. All systems green, Commander.",
+                "deterministic_fallback",
+            )
+        return (
+            f"Calibration complete with active {ship['alert_level']} condition in {ship['zone']}: "
+            f"minimum shields {min_sh:.0f} percent, hydrogen {ship['hydrogen_fuel_pct']:.0f} percent. Standing by for orders.",
+            "deterministic_fallback",
+        )
+
     async def _call_openai_compat(
         self,
         base_url: str,
         headers: dict[str, str],
-        model: str,
+        model: str | None,
         provider_label: str,
         compiled: CompiledPrompt,
         recent_history: list[dict[str, str]],
@@ -128,32 +206,46 @@ class LLMRouter:
         messages.append({"role": "user", "content": compiled.user_message})
 
         payload: dict[str, Any] = {
-            "model": model,
             "messages": messages,
             "tools": TOOL_DEFINITIONS,
             "tool_choice": "auto",
+            "stream": False,
             "temperature": 0.7,
         }
+        if model:
+            payload["model"] = model
 
         receipts: list[dict[str, Any]] = []
         saved_memories: list[dict[str, Any]] = []
 
         try:
-            async with httpx.AsyncClient(timeout=25.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(base_url, headers=headers, json=payload)
                 resp.raise_for_status()
                 data = resp.json()
+                used_model = data.get("model") or model or provider_label
                 choice = data["choices"][0]["message"]
                 tool_calls = choice.get("tool_calls") or []
 
                 if tool_calls:
-                    messages.append(choice)
-                    for tc in tool_calls:
+                    # Player2 Message schema requires non-null `content` string
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": choice.get("content") or "",
+                        "tool_calls": tool_calls,
+                    }
+                    messages.append(assistant_msg)
+
+                    for idx, tc in enumerate(tool_calls):
                         fn_name = tc["function"]["name"]
-                        try:
-                            args = json.loads(tc["function"].get("arguments") or "{}")
-                        except json.JSONDecodeError:
-                            args = {}
+                        raw_args = tc["function"].get("arguments") or "{}"
+                        if isinstance(raw_args, dict):
+                            args = raw_args
+                        else:
+                            try:
+                                args = json.loads(raw_args)
+                            except json.JSONDecodeError:
+                                args = {}
 
                         if fn_name == "trigger_game_action":
                             action_id = str(args.get("action_id", ""))
@@ -175,33 +267,36 @@ class LLMRouter:
                         messages.append(
                             {
                                 "role": "tool",
-                                "tool_call_id": tc["id"],
+                                "tool_call_id": tc.get("id") or f"call_{idx}",
                                 "content": tool_out,
                             }
                         )
 
-                    # Second turn so the LLM speaks using ONLY the truthful receipts
-                    followup = await client.post(
-                        base_url,
-                        headers=headers,
-                        json={"model": model, "messages": messages, "temperature": 0.7},
-                    )
+                    followup_payload: dict[str, Any] = {
+                        "messages": messages,
+                        "stream": False,
+                        "temperature": 0.7,
+                    }
+                    if model:
+                        followup_payload["model"] = model
+
+                    followup = await client.post(base_url, headers=headers, json=followup_payload)
                     followup.raise_for_status()
-                    reply_text = followup.json()["choices"][0]["message"].get("content") or "Action processed."
+                    reply_text = (followup.json()["choices"][0]["message"].get("content") or "Action processed.").strip()
                 else:
-                    reply_text = choice.get("content") or "Standing by, Commander."
+                    reply_text = (choice.get("content") or "Standing by, Commander.").strip()
 
                 mood = self._infer_mood(reply_text, telemetry_snapshot, receipts)
                 return {
                     "reply": reply_text,
-                    "provider_used": provider_label,
+                    "provider_used": f"{provider_label} ({used_model})",
                     "mood": mood,
                     "receipts": receipts,
                     "saved_memories": saved_memories,
                 }
         except Exception as exc:
             fallback = self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
-            fallback["provider_used"] = f"demo_fallback ({provider_label} unavailable: {exc.__class__.__name__})"
+            fallback["provider_used"] = f"demo_fallback ({provider_label} err: {exc.__class__.__name__})"
             return fallback
 
     def _demo_respond(
@@ -216,7 +311,6 @@ class LLMRouter:
         receipts: list[dict[str, Any]] = []
         saved_memories: list[dict[str, Any]] = []
 
-        # 1. Explicit memory save ("remember that ...")
         mem_match = re.search(r"(?:remember(?:\s+that)?|note(?:\s+that)?)\s+(.+)", text, re.IGNORECASE)
         if mem_match:
             fact = mem_match.group(1).strip()
@@ -235,7 +329,6 @@ class LLMRouter:
                 "saved_memories": saved_memories,
             }
 
-        # 2. Prompt-injection demonstration
         if compiled.injection_flagged:
             return {
                 "reply": (
@@ -248,7 +341,6 @@ class LLMRouter:
                 "saved_memories": [],
             }
 
-        # 3. Ship action intent parsing -> Transition Authority
         action_triggers: list[tuple[list[str], str]] = [
             (["self destruct", "self-destruct", "blow up the ship"], "self_destruct"),
             (["eject", "bail out"], "eject"),
@@ -288,7 +380,6 @@ class LLMRouter:
                 "saved_memories": [],
             }
 
-        # 4. Jokes & banter
         if any(w in low for w in ["joke", "funny", "laugh", "cheer me up"]):
             return {
                 "reply": random.choice(JOKES),
@@ -298,7 +389,6 @@ class LLMRouter:
                 "saved_memories": [],
             }
 
-        # 5. Fleet / Allies C2 Hologram query
         if any(w in low for w in ["ally", "allies", "fleet", "squad", "where is", "kestrel", "docvex", "atlas", "valkyrie"]):
             distress = [a for a in fleet_snapshot if a["under_fire"] or a["status"] == "DISTRESS"]
             summary = "; ".join(
@@ -318,7 +408,6 @@ class LLMRouter:
                 "saved_memories": [],
             }
 
-        # 6. Ship status / telemetry report
         if any(w in low for w in ["status", "report", "shields", "fuel", "vitals", "telemetry"]):
             sh = telemetry_snapshot["shields"]
             min_sh = min(sh["front"], sh["back"], sh["left"], sh["right"])
@@ -335,7 +424,6 @@ class LLMRouter:
                 "saved_memories": [],
             }
 
-        # 7. RAG memory recall response
         if compiled.retrieved_memories:
             top = compiled.retrieved_memories[0]
             return {
@@ -353,7 +441,7 @@ class LLMRouter:
             "reply": (
                 f"AETHER online in {telemetry_snapshot['zone']}. "
                 "You can ask me to toggle ship systems, check allied fleet positions on the hologram, "
-                "tell a joke, or remember crew notes. Connect Player2 or OpenRouter in Config for full conversational AI!"
+                "tell a joke, or remember crew notes."
             ),
             "provider_used": "demo",
             "mood": "NOMINAL",
@@ -367,6 +455,6 @@ class LLMRouter:
             return "CAUTION"
         if telemetry.get("alert_level") == "COMBAT":
             return "COMBAT"
-        if any(w in text.lower() for w in ["joke", "duct tape", "elevator", "champagne"]):
+        if any(w in text.lower() for w in ["joke", "duct tape", "elevator", "champagne", "haha"]):
             return "HUMOR"
         return telemetry.get("alert_level", "NOMINAL")

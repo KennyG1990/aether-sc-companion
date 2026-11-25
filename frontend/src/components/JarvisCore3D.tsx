@@ -2,9 +2,10 @@ import React, { useEffect, useRef } from "react";
 import * as THREE from "three";
 
 interface JarvisCore3DProps {
-  mood: string; // NOMINAL | CAUTION | COMBAT | HUMOR
+  mood: string; // NOMINAL | CAUTION | COMBAT | HUMOR | CALIBRATING
   speaking: boolean;
   listening: boolean;
+  audioLevelRef: React.MutableRefObject<number>;
 }
 
 const MOOD_COLORS: Record<string, number> = {
@@ -12,9 +13,10 @@ const MOOD_COLORS: Record<string, number> = {
   CAUTION: 0xf59e0b,
   COMBAT: 0xef4444,
   HUMOR: 0xa855f7,
+  CALIBRATING: 0x38bdf8,
 };
 
-export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, listening }) => {
+export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, listening, audioLevelRef }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef({ mood, speaking, listening });
 
@@ -42,7 +44,7 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, list
     const root = new THREE.Group();
     scene.add(root);
 
-    // Inner holographic "face / neural core" icosahedron
+    // Outer holographic neural face/sphere
     const coreGeo = new THREE.IcosahedronGeometry(1.15, 2);
     const coreMat = new THREE.MeshBasicMaterial({
       color: 0x22d3ee,
@@ -53,7 +55,7 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, list
     const coreMesh = new THREE.Mesh(coreGeo, coreMat);
     root.add(coreMesh);
 
-    // Glowing inner nucleus
+    // Inner nucleus
     const innerGeo = new THREE.OctahedronGeometry(0.55, 1);
     const innerMat = new THREE.MeshBasicMaterial({
       color: 0x67e8f9,
@@ -64,7 +66,7 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, list
     const innerMesh = new THREE.Mesh(innerGeo, innerMat);
     root.add(innerMesh);
 
-    // Three counter-rotating Jarvis gyro rings
+    // Counter-rotating Jarvis gyro rings
     const ringMat = new THREE.MeshBasicMaterial({
       color: 0x22d3ee,
       transparent: true,
@@ -79,10 +81,10 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, list
     root.add(ring1, ring2, ring3);
 
     // Orbital neural particles
-    const particleCount = 160;
+    const particleCount = 180;
     const positions = new Float32Array(particleCount * 3);
     for (let i = 0; i < particleCount; i++) {
-      const r = 1.35 + Math.random() * 1.1;
+      const r = 1.35 + Math.random() * 1.15;
       const theta = Math.random() * Math.PI * 2;
       const phi = Math.acos(2 * Math.random() - 1);
       positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
@@ -109,9 +111,17 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, list
       animId = requestAnimationFrame(animate);
       const t = clock.getElapsedTime();
       const { mood: m, speaking: isSpeaking, listening: isListening } = stateRef.current;
+      const amp = audioLevelRef.current || 0;
 
-      targetColor.setHex(MOOD_COLORS[m] ?? 0x22d3ee);
-      currentColor.lerp(targetColor, 0.08);
+      if (m === "CALIBRATING") {
+        // Scanning sweep between amber and cyan while calibrating
+        const mix = (Math.sin(t * 5.0) + 1) * 0.5;
+        targetColor.setHex(0xf59e0b).lerp(new THREE.Color(0x22d3ee), mix);
+      } else {
+        targetColor.setHex(MOOD_COLORS[m] ?? 0x22d3ee);
+      }
+
+      currentColor.lerp(targetColor, 0.1);
       coreMat.color.copy(currentColor);
       innerMat.color.copy(currentColor);
       ringMat.color.copy(currentColor);
@@ -119,17 +129,22 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, list
       (ring3.material as THREE.MeshBasicMaterial).color.copy(currentColor);
       pMat.color.copy(currentColor);
 
-      // Voice/listening pulse
-      const voicePulse = isSpeaking
-        ? 1.0 + Math.abs(Math.sin(t * 14.0)) * 0.16 + Math.sin(t * 23.0) * 0.05
-        : isListening
-          ? 1.08 + Math.sin(t * 7.0) * 0.06
-          : 1.0 + Math.sin(t * 2.2) * 0.03;
+      // Real Web Audio amplitude pulse when ElevenLabs audio plays, fallback synthetic pulse otherwise
+      let voicePulse = 1.0 + Math.sin(t * 2.2) * 0.03;
+      if (isSpeaking) {
+        const liveAmp = amp > 0.01 ? amp * 0.42 : Math.abs(Math.sin(t * 14.0)) * 0.14;
+        voicePulse = 1.03 + liveAmp;
+      } else if (m === "CALIBRATING") {
+        voicePulse = 1.05 + Math.sin(t * 10.0) * 0.08;
+      } else if (isListening) {
+        voicePulse = 1.08 + Math.sin(t * 7.0) * 0.06;
+      }
 
       coreMesh.scale.setScalar(voicePulse);
-      innerMesh.scale.setScalar(0.95 + (voicePulse - 1.0) * 1.6);
+      innerMesh.scale.setScalar(0.95 + (voicePulse - 1.0) * 1.9);
 
-      const spinBoost = isSpeaking ? 2.4 : isListening ? 1.8 : 1.0;
+      const spinBoost =
+        m === "CALIBRATING" ? 4.2 : isSpeaking ? 2.2 + amp * 3.0 : isListening ? 1.8 : 1.0;
       coreMesh.rotation.y += 0.006 * spinBoost;
       coreMesh.rotation.x += 0.003 * spinBoost;
       innerMesh.rotation.y -= 0.015 * spinBoost;
@@ -181,8 +196,8 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({ mood, speaking, list
           pointerEvents: "none",
         }}
       >
-        <span>STATE: {speaking ? "TRANSMITTING" : listening ? "LISTENING..." : mood}</span>
-        <span>NEURAL CORE // v0.1</span>
+        <span>STATE: {mood === "CALIBRATING" ? "CALIBRATING..." : speaking ? "TRANSMITTING" : listening ? "LISTENING..." : mood}</span>
+        <span>ELEVENLABS // P2</span>
       </div>
     </div>
   );

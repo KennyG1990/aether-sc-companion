@@ -1,16 +1,20 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Radio, Shield, Cpu } from "lucide-react";
+import { Radio, Shield, Cpu, Power } from "lucide-react";
 import { JarvisCore3D } from "./components/JarvisCore3D";
 import { HoloDeck3D } from "./components/HoloDeck3D";
 import { CommsPanel } from "./components/CommsPanel";
 import { InspectorPanel } from "./components/InspectorPanel";
+import { CalibrationOverlay } from "./components/CalibrationOverlay";
 import {
   AetherConfigData,
   AllyShipState,
+  CalibrationResult,
+  CalibrationStep,
   ChatMessage,
   PendingConfirmation,
   ShipTelemetry,
   TelemetryEvent,
+  VoiceOption,
 } from "./types";
 
 const DEFAULT_SHIP: ShipTelemetry = {
@@ -55,6 +59,7 @@ export default function App() {
   const [selectedAlly, setSelectedAlly] = useState<AllyShipState | null>(null);
   const [pendingConfirmations, setPendingConfirmations] = useState<PendingConfirmation[]>([]);
   const [config, setConfig] = useState<AetherConfigData | null>(null);
+  const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [wsConnected, setWsConnected] = useState(false);
 
   const [mood, setMood] = useState("NOMINAL");
@@ -64,12 +69,18 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
 
+  // Startup Calibration state
+  const [showCalibration, setShowCalibration] = useState(true);
+  const [calibrating, setCalibrating] = useState(false);
+  const [calSteps, setCalSteps] = useState<CalibrationStep[]>([]);
+  const [calResult, setCalResult] = useState<CalibrationResult | null>(null);
+
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "boot-1",
       role: "assistant",
       content:
-        "AETHER online, Commander. Local telemetry stream active, Stanton Fleet C2 hologram synced, and SQLite Hybrid RAG standing by. Give me a voice order or try triggering a Pirate Ambush.",
+        "AETHER standing by for startup calibration. Click POWER ON & CALIBRATE to sync Player2 neural LLM, ElevenLabs voice synthesis, SQLite RAG, and Star Citizen ship telemetry.",
       mood: "NOMINAL",
       provider: "system",
       timestamp: Date.now(),
@@ -78,38 +89,196 @@ export default function App() {
 
   const recognitionRef = useRef<any>(null);
   const seenEventIdsRef = useRef<Set<string>>(new Set());
+  const audioLevelRef = useRef<number>(0);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const ttsQueueRef = useRef<string[]>([]);
+  const ttsPlayingRef = useRef<boolean>(false);
+  const ttsEnabledRef = useRef<boolean>(true);
+  const calibratingRef = useRef<boolean>(false);
 
-  const speak = (text: string) => {
-    if (!ttsEnabled || typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  useEffect(() => {
+    ttsEnabledRef.current = ttsEnabled;
+  }, [ttsEnabled]);
+
+  useEffect(() => {
+    calibratingRef.current = calibrating;
+  }, [calibrating]);
+
+  const browserSpeakFallback = (text: string): Promise<void> =>
+    new Promise((resolve) => {
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+        resolve();
+        return;
+      }
+      try {
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.rate = 1.04;
+        utter.pitch = 0.94;
+        utter.onstart = () => setSpeaking(true);
+        utter.onend = () => {
+          setSpeaking(false);
+          audioLevelRef.current = 0;
+          resolve();
+        };
+        utter.onerror = () => {
+          setSpeaking(false);
+          audioLevelRef.current = 0;
+          resolve();
+        };
+        window.speechSynthesis.speak(utter);
+      } catch {
+        setSpeaking(false);
+        resolve();
+      }
+    });
+
+  const playElevenLabsAudio = async (text: string): Promise<boolean> => {
     try {
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.rate = 1.05;
-      utter.pitch = 0.95;
-      utter.onstart = () => setSpeaking(true);
-      utter.onend = () => setSpeaking(false);
-      utter.onerror = () => setSpeaking(false);
-      window.speechSynthesis.speak(utter);
+      const res = await fetch("/api/tts/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) return false;
+      const blob = await res.blob();
+      if (!blob || blob.size < 100) return false;
+
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.crossOrigin = "anonymous";
+
+      // Attach Web Audio AnalyserNode so JarvisCore3D pulses to real ElevenLabs speech amplitude!
+      let rafId = 0;
+      try {
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        if (!audioCtxRef.current && AudioCtx) {
+          audioCtxRef.current = new AudioCtx();
+        }
+        const ctx = audioCtxRef.current;
+        if (ctx) {
+          if (ctx.state === "suspended") await ctx.resume();
+          const source = ctx.createMediaElementSource(audio);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+          analyser.connect(ctx.destination);
+          const bins = new Uint8Array(analyser.frequencyBinCount);
+
+          const sampleAmp = () => {
+            analyser.getByteTimeDomainData(bins);
+            let sumSq = 0;
+            for (let i = 0; i < bins.length; i++) {
+              const v = (bins[i] - 128) / 128;
+              sumSq += v * v;
+            }
+            const rms = Math.sqrt(sumSq / bins.length);
+            audioLevelRef.current = Math.min(1.0, rms * 3.8);
+            rafId = requestAnimationFrame(sampleAmp);
+          };
+          rafId = requestAnimationFrame(sampleAmp);
+        }
+      } catch {
+        // Fallback to plain Audio playback if AudioContext restricted
+      }
+
+      return await new Promise<boolean>((resolve) => {
+        setSpeaking(true);
+        const cleanup = (ok: boolean) => {
+          if (rafId) cancelAnimationFrame(rafId);
+          audioLevelRef.current = 0;
+          setSpeaking(false);
+          URL.revokeObjectURL(url);
+          resolve(ok);
+        };
+        audio.onended = () => cleanup(true);
+        audio.onerror = () => cleanup(false);
+        audio.play().catch(() => cleanup(false));
+      });
     } catch {
-      setSpeaking(false);
+      return false;
     }
   };
 
-  const fetchConfig = async () => {
+  const drainSpeechQueue = async () => {
+    if (ttsPlayingRef.current) return;
+    ttsPlayingRef.current = true;
     try {
-      const res = await fetch("/api/config");
-      if (res.ok) {
-        const data: AetherConfigData = await res.json();
+      while (ttsQueueRef.current.length > 0) {
+        const nextText = ttsQueueRef.current.shift();
+        if (!nextText || !ttsEnabledRef.current) continue;
+        const played = await playElevenLabsAudio(nextText);
+        if (!played && ttsEnabledRef.current) {
+          await browserSpeakFallback(nextText);
+        }
+      }
+    } finally {
+      ttsPlayingRef.current = false;
+      setSpeaking(false);
+      audioLevelRef.current = 0;
+    }
+  };
+
+  const speak = (text: string) => {
+    if (!ttsEnabledRef.current || !text.trim()) return;
+    ttsQueueRef.current.push(text.trim());
+    void drainSpeechQueue();
+  };
+
+  const fetchConfigAndVoices = async () => {
+    try {
+      const [cfgRes, vRes] = await Promise.all([fetch("/api/config"), fetch("/api/tts/voices")]);
+      if (cfgRes.ok) {
+        const data: AetherConfigData = await cfgRes.json();
         setConfig(data);
         setTtsEnabled(data.tts_enabled);
+      }
+      if (vRes.ok) {
+        const vData = await vRes.json();
+        setVoices(vData.voices || []);
       }
     } catch {
       // Backend starting up
     }
   };
 
+  const runCalibration = async () => {
+    setShowCalibration(true);
+    setCalibrating(true);
+    setCalSteps([]);
+    setCalResult(null);
+    setMood("CALIBRATING");
+
+    // Speak "Calibrating..." immediately via ElevenLabs while live probes run!
+    speak("Calibrating. Running full neural link, voice matrix, and ship telemetry diagnostics.");
+
+    try {
+      const res = await fetch("/api/calibrate", { method: "POST" });
+      if (res.ok) {
+        const result: CalibrationResult = await res.json();
+        setCalResult(result);
+        setCalSteps(result.steps || []);
+        setMood(result.status === "ALL_SYSTEMS_GREEN" ? "NOMINAL" : result.status);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `cal-${Date.now()}`,
+            role: "assistant",
+            content: `[CALIBRATION ${result.status}] ${result.briefing}`,
+            provider: result.provider_used,
+            timestamp: Date.now(),
+          },
+        ]);
+        speak(result.briefing);
+        await fetchConfigAndVoices();
+      }
+    } finally {
+      setCalibrating(false);
+    }
+  };
+
   useEffect(() => {
-    fetchConfig();
+    fetchConfigAndVoices();
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const wsUrl = `${proto}://${window.location.host}/ws/telemetry`;
     let ws: WebSocket | null = null;
@@ -131,18 +300,24 @@ export default function App() {
         if (disposed) return;
         try {
           const data = JSON.parse(ev.data);
+          if (data.type === "calibration_progress" && data.steps) {
+            setCalSteps(data.steps);
+            return;
+          }
           if (data.type === "telemetry_frame") {
             setShip(data.ship);
             setFleet(data.fleet || []);
             setPendingConfirmations(data.pending_confirmations || []);
 
-            const level = data.ship?.alert_level;
-            if (level === "COMBAT") {
-              setMood("COMBAT");
-            } else if (level === "CAUTION") {
-              setMood("CAUTION");
-            } else if (level === "NOMINAL") {
-              setMood((prev) => (prev === "COMBAT" || prev === "CAUTION" ? "NOMINAL" : prev));
+            if (!calibratingRef.current) {
+              const level = data.ship?.alert_level;
+              if (level === "COMBAT") {
+                setMood("COMBAT");
+              } else if (level === "CAUTION") {
+                setMood("CAUTION");
+              } else if (level === "NOMINAL") {
+                setMood((prev) => (prev === "COMBAT" || prev === "CAUTION" ? "NOMINAL" : prev));
+              }
             }
 
             const events: TelemetryEvent[] = (data.events || []).filter((evt: TelemetryEvent) => {
@@ -352,6 +527,15 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <CalibrationOverlay
+        visible={showCalibration}
+        calibrating={calibrating}
+        steps={calSteps}
+        result={calResult}
+        onStartCalibration={runCalibration}
+        onDismiss={() => setShowCalibration(false)}
+      />
+
       <header className="topbar">
         <div className="brand">
           <Cpu size={18} color="#22d3ee" />
@@ -362,14 +546,17 @@ export default function App() {
         </div>
 
         <div className="status-pills">
+          <button className="btn active" onClick={runCalibration} disabled={calibrating}>
+            <Power size={12} /> {calibrating ? "CALIBRATING..." : "CALIBRATE"}
+          </button>
           <span className={`pill ${wsConnected ? "emerald" : "crimson"}`}>
             <Radio size={12} /> {wsConnected ? "TELEMETRY 17Hz" : "DISCONNECTED"}
           </span>
           <span className={`pill ${alertPillClass}`}>
             <Shield size={12} /> {ship.alert_level}
           </span>
-          <span className="pill">LLM: {(config?.llm_provider || "demo").toUpperCase()}</span>
-          <span className="pill">{ship.zone.toUpperCase()}</span>
+          <span className="pill">LLM: {(config?.llm_provider || "player2").toUpperCase()}</span>
+          <span className="pill">TTS: {(config?.tts_provider === "browser" ? "BROWSER" : "ELEVENLABS")}</span>
         </div>
       </header>
 
@@ -380,7 +567,12 @@ export default function App() {
               <span>AETHER // NEURAL AVATAR</span>
               <span style={{ fontSize: 10, color: "#7ea3c4" }}>{config?.pilot_callsign || "CMDR-01"}</span>
             </div>
-            <JarvisCore3D mood={mood} speaking={speaking} listening={listening} />
+            <JarvisCore3D
+              mood={mood}
+              speaking={speaking}
+              listening={listening}
+              audioLevelRef={audioLevelRef}
+            />
           </div>
 
           <CommsPanel
@@ -406,9 +598,11 @@ export default function App() {
         <InspectorPanel
           ship={ship}
           config={config}
+          voices={voices}
           onExecuteAction={executeAction}
           onTriggerScenario={triggerScenario}
           onSaveConfig={saveConfig}
+          onTestVoice={() => speak("AETHER vocal synthesizer online. All systems green, Commander.")}
           refreshTick={refreshTick}
         />
       </main>

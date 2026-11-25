@@ -1,21 +1,25 @@
 import React, { useEffect, useState } from "react";
-import { ActionReceipt, AetherConfigData, RetrievedMemoryHit, ShipTelemetry } from "../types";
+import { ActionReceipt, AetherConfigData, RetrievedMemoryHit, ShipTelemetry, VoiceOption } from "../types";
 
 interface InspectorPanelProps {
   ship: ShipTelemetry;
   config: AetherConfigData | null;
+  voices: VoiceOption[];
   onExecuteAction: (actionId: string) => void;
   onTriggerScenario: (scenario: string) => void;
   onSaveConfig: (patch: Record<string, unknown>) => void;
+  onTestVoice: () => void;
   refreshTick: number;
 }
 
 export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   ship,
   config,
+  voices,
   onExecuteAction,
   onTriggerScenario,
   onSaveConfig,
+  onTestVoice,
   refreshTick,
 }) => {
   const [tab, setTab] = useState<"systems" | "rag" | "receipts" | "config">("systems");
@@ -25,7 +29,10 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   const [receipts, setReceipts] = useState<ActionReceipt[]>([]);
 
   // Config form state
-  const [provider, setProvider] = useState("demo");
+  const [provider, setProvider] = useState("player2");
+  const [ttsProvider, setTtsProvider] = useState("player2_elevenlabs");
+  const [voiceId, setVoiceId] = useState("01955d76-ed5b-754f-a070-a570ddfed516");
+  const [elevenKey, setElevenKey] = useState("");
   const [telemetryMode, setTelemetryMode] = useState("simulator");
   const [openRouterKey, setOpenRouterKey] = useState("");
   const [openRouterModel, setOpenRouterModel] = useState("anthropic/claude-3.7-sonnet");
@@ -34,6 +41,8 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   useEffect(() => {
     if (config) {
       setProvider(config.llm_provider);
+      setTtsProvider(config.tts_provider);
+      setVoiceId(config.elevenlabs_voice_id);
       setTelemetryMode(config.telemetry_mode);
       setOpenRouterModel(config.openrouter_model);
       setPlayer2Url(config.player2_base_url);
@@ -273,79 +282,140 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
         )}
 
         {tab === "config" && (
-          <div className="card">
-            <div className="card-title">LLM &amp; Star Citizen Telemetry Config</div>
-            <div className="field-group">
-              <label>LLM Decision Backend</label>
-              <select className="select-input" value={provider} onChange={(e) => setProvider(e.target.value)}>
-                <option value="demo">Offline Demo Co-Pilot (Zero Keys)</option>
-                <option value="player2">Player2 Local Backend (localhost:4315)</option>
-                <option value="openrouter">OpenRouter Cloud API</option>
-              </select>
-            </div>
-            <div className="field-group">
-              <label>Player2 Base URL</label>
-              <input className="text-input" value={player2Url} onChange={(e) => setPlayer2Url(e.target.value)} />
-            </div>
-            <div className="field-group">
-              <label>OpenRouter Model</label>
-              <input
-                className="text-input"
-                value={openRouterModel}
-                onChange={(e) => setOpenRouterModel(e.target.value)}
-              />
-            </div>
-            <div className="field-group">
-              <label>
-                OpenRouter API Key {config?.openrouter_api_key_set ? "(Configured)" : "(Optional)"}
-              </label>
-              <input
-                className="text-input"
-                type="password"
-                placeholder="sk-or-v1-..."
-                value={openRouterKey}
-                onChange={(e) => setOpenRouterKey(e.target.value)}
-              />
-            </div>
-            <div className="field-group">
-              <label>Star Citizen Telemetry Source</label>
-              <select
-                className="select-input"
-                value={telemetryMode}
-                onChange={(e) => setTelemetryMode(e.target.value)}
-              >
-                <option value="simulator">Built-in 17Hz Flight &amp; Fleet Simulator</option>
-                <option value="grpc">Live Star Citizen gRPC (127.0.0.1:2942)</option>
-              </select>
-            </div>
-            <button
-              className="btn active"
-              style={{ width: "100%", justifyContent: "center", marginTop: 6 }}
-              onClick={() => {
-                const patch: Record<string, unknown> = {
-                  llm_provider: provider,
-                  player2_base_url: player2Url,
-                  openrouter_model: openRouterModel,
-                  telemetry_mode: telemetryMode,
-                };
-                if (openRouterKey.trim()) {
-                  patch.openrouter_api_key = openRouterKey.trim();
-                }
-                onSaveConfig(patch);
-                setOpenRouterKey("");
-              }}
-            >
-              APPLY CONFIGURATION
-            </button>
-
-            {config?.grpc_status && (
-              <div style={{ marginTop: 12, fontSize: 11, color: "#7ea3c4", lineHeight: 1.5 }}>
-                <div>gRPC Target: {config.grpc_status.target}</div>
-                <div>Port Open: {config.grpc_status.port_open ? "YES" : "NO"}</div>
-                <div>Proto Loaded: {config.grpc_status.proto_loaded ? "YES" : "Pending sc_make_proto"}</div>
+          <>
+            {config?.player2_status && (
+              <div className="card">
+                <div className="card-title">Live Player2 Link (4315 / MCP 9847)</div>
+                <div style={{ fontSize: 11.5, lineHeight: 1.6, color: "#cbd5e1" }}>
+                  <div>
+                    API:{" "}
+                    <strong style={{ color: config.player2_status.api_online ? "#6ee7b7" : "#fca5a5" }}>
+                      {config.player2_status.api_online
+                        ? `ONLINE (v${config.player2_status.client_version})`
+                        : "OFFLINE"}
+                    </strong>
+                  </div>
+                  {config.player2_status.joules !== null && (
+                    <div>
+                      Account: {config.player2_status.patron_tier} · {config.player2_status.joules} Joules
+                    </div>
+                  )}
+                  <div>
+                    MCP Server:{" "}
+                    <strong style={{ color: config.player2_status.mcp_online ? "#6ee7b7" : "#f59e0b" }}>
+                      {config.player2_status.mcp_online ? config.player2_status.mcp_server : "OFFLINE"}
+                    </strong>
+                  </div>
+                  <div>ElevenLabs Voices: {config.player2_status.elevenlabs_voices_count}</div>
+                </div>
               </div>
             )}
-          </div>
+
+            <div className="card">
+              <div className="card-title">LLM, ElevenLabs Voice &amp; Telemetry</div>
+              <div className="field-group">
+                <label>LLM Decision Backend</label>
+                <select className="select-input" value={provider} onChange={(e) => setProvider(e.target.value)}>
+                  <option value="player2">Player2 Local LLM (127.0.0.1:4315)</option>
+                  <option value="openrouter">OpenRouter Cloud API</option>
+                  <option value="demo">Offline Demo Co-Pilot (Zero Keys)</option>
+                </select>
+              </div>
+              <div className="field-group">
+                <label>TTS Voice Engine</label>
+                <select className="select-input" value={ttsProvider} onChange={(e) => setTtsProvider(e.target.value)}>
+                  <option value="player2_elevenlabs">ElevenLabs via Player2 (Zero Key)</option>
+                  <option value="elevenlabs_direct">Direct ElevenLabs API (Custom Key)</option>
+                  <option value="browser">Browser SpeechSynthesis Fallback</option>
+                </select>
+              </div>
+              <div className="field-group">
+                <label>ElevenLabs Voice (Jarvis British Male at top)</label>
+                <select className="select-input" value={voiceId} onChange={(e) => setVoiceId(e.target.value)}>
+                  {voices.map((v) => (
+                    <option key={v.voice_id} value={v.voice_id}>
+                      {v.name} {v.accent || v.gender ? `(${v.accent} ${v.gender})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {ttsProvider === "elevenlabs_direct" && (
+                <div className="field-group">
+                  <label>
+                    ElevenLabs API Key {config?.elevenlabs_api_key_set ? "(Configured)" : "(Required for Direct)"}
+                  </label>
+                  <input
+                    className="text-input"
+                    type="password"
+                    placeholder="sk_..."
+                    value={elevenKey}
+                    onChange={(e) => setElevenKey(e.target.value)}
+                  />
+                </div>
+              )}
+              <div className="field-group">
+                <label>Player2 Base URL</label>
+                <input className="text-input" value={player2Url} onChange={(e) => setPlayer2Url(e.target.value)} />
+              </div>
+              <div className="field-group">
+                <label>OpenRouter Model</label>
+                <input
+                  className="text-input"
+                  value={openRouterModel}
+                  onChange={(e) => setOpenRouterModel(e.target.value)}
+                />
+              </div>
+              <div className="field-group">
+                <label>
+                  OpenRouter API Key {config?.openrouter_api_key_set ? "(Configured)" : "(Optional)"}
+                </label>
+                <input
+                  className="text-input"
+                  type="password"
+                  placeholder="sk-or-v1-..."
+                  value={openRouterKey}
+                  onChange={(e) => setOpenRouterKey(e.target.value)}
+                />
+              </div>
+              <div className="field-group">
+                <label>Star Citizen Telemetry Source</label>
+                <select
+                  className="select-input"
+                  value={telemetryMode}
+                  onChange={(e) => setTelemetryMode(e.target.value)}
+                >
+                  <option value="simulator">Built-in 17Hz Flight &amp; Fleet Simulator</option>
+                  <option value="grpc">Live Star Citizen gRPC (127.0.0.1:2942)</option>
+                </select>
+              </div>
+              <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                <button
+                  className="btn active"
+                  style={{ flex: 1, justifyContent: "center" }}
+                  onClick={() => {
+                    const patch: Record<string, unknown> = {
+                      llm_provider: provider,
+                      tts_provider: ttsProvider,
+                      elevenlabs_voice_id: voiceId,
+                      player2_base_url: player2Url,
+                      openrouter_model: openRouterModel,
+                      telemetry_mode: telemetryMode,
+                    };
+                    if (openRouterKey.trim()) patch.openrouter_api_key = openRouterKey.trim();
+                    if (elevenKey.trim()) patch.elevenlabs_api_key = elevenKey.trim();
+                    onSaveConfig(patch);
+                    setOpenRouterKey("");
+                    setElevenKey("");
+                  }}
+                >
+                  APPLY CONFIG
+                </button>
+                <button className="btn" onClick={onTestVoice}>
+                  TEST VOICE
+                </button>
+              </div>
+            </div>
+          </>
         )}
       </div>
     </div>

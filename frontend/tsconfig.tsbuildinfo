@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/types.ts","./src/components/commspanel.tsx","./src/components/holodeck3d.tsx","./src/components/inspectorpanel.tsx","./src/components/jarviscore3d.tsx"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/main.tsx","./src/types.ts","./src/components/calibrationoverlay.tsx","./src/components/commspanel.tsx","./src/components/holodeck3d.tsx","./src/components/inspectorpanel.tsx","./src/components/jarviscore3d.tsx"],"version":"5.9.3"}

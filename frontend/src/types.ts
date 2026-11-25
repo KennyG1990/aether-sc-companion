@@ -110,12 +110,52 @@ export interface ChatMessage {
   timestamp: number;
 }
 
+export interface VoiceOption {
+  voice_id: string;
+  name: string;
+  accent: string;
+  gender: string;
+  category: string;
+}
+
+export interface Player2Status {
+  api_online: boolean;
+  client_version: string | null;
+  joules: number | null;
+  patron_tier: string | null;
+  elevenlabs_voices_count: number;
+  mcp_online: boolean;
+  mcp_server: string | null;
+}
+
+export interface CalibrationStep {
+  id: string;
+  label: string;
+  status: "RUNNING" | "OK" | "WARN";
+  detail: string;
+  progress: number;
+  timestamp: number;
+}
+
+export interface CalibrationResult {
+  status: string;
+  briefing: string;
+  provider_used: string;
+  duration_sec: number;
+  steps: CalibrationStep[];
+}
+
 export interface AetherConfigData {
   llm_provider: string;
   player2_base_url: string;
+  player2_mcp_url: string;
   player2_game_key: string;
   openrouter_api_key_set: boolean;
   openrouter_model: string;
+  tts_provider: string;
+  elevenlabs_voice_id: string;
+  elevenlabs_model_id: string;
+  elevenlabs_api_key_set: boolean;
   telemetry_mode: string;
   grpc_target: string;
   proactive_alerts_enabled: boolean;
@@ -128,4 +168,5 @@ export interface AetherConfigData {
     proto_loaded: boolean;
     last_error: string | null;
   };
+  player2_status?: Player2Status;
 }
