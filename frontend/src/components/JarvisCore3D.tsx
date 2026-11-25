@@ -72,24 +72,26 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
     const holoFillMat = new THREE.MeshBasicMaterial({
       color: 0x0ea5e9,
       transparent: true,
-      opacity: 0.24,
+      opacity: 0.28,
+      depthWrite: false,
     });
     const holoWireMat = new THREE.MeshBasicMaterial({
       color: 0x38bdf8,
       wireframe: true,
       transparent: true,
-      opacity: 0.62,
+      opacity: 0.78,
     });
     const holoAccentMat = new THREE.MeshBasicMaterial({
       color: 0xe0f2fe,
       transparent: true,
-      opacity: 0.95,
+      opacity: 0.96,
     });
     const ringMat = new THREE.MeshBasicMaterial({
       color: 0x22d3ee,
       transparent: true,
       opacity: 0.55,
       side: THREE.DoubleSide,
+      depthWrite: false,
     });
 
     const makeHoloPart = (geo: THREE.BufferGeometry): THREE.Group => {
@@ -108,15 +110,18 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
     pedestalRing2.rotation.x = Math.PI / 2;
     pedestalRing2.position.y = -0.88;
 
-    const beamGeo = new THREE.CylinderGeometry(0.95, 0.68, 1.85, 24, 1, true);
+    const beamGeo = new THREE.CylinderGeometry(1.05, 0.68, 1.75, 24, 1, true);
     const beamMat = new THREE.MeshBasicMaterial({
       color: 0x22d3ee,
       transparent: true,
-      opacity: 0.06,
+      opacity: 0.08,
       side: THREE.DoubleSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
     });
     const beamMesh = new THREE.Mesh(beamGeo, beamMat);
-    beamMesh.position.y = 0.0;
+    beamMesh.position.y = -0.05;
+    beamMesh.renderOrder = 2;
     root.add(pedestalRing1, pedestalRing2, beamMesh);
 
     // === CORTANA-STYLE HUMANOID FIGURE ===
