@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from ..config import AetherConfig, PersonaProfile
+from ..integrations.spotify import SpotifyConnector
 from ..rag.compiler import CompiledPrompt
 from ..rag.store import MemoryStore
 from ..telemetry.actions import ActionExecutor
@@ -72,16 +73,54 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "spotify_control",
+            "description": "Launch Spotify and play a requested song, artist, album, or playlist, or control playback (pause, resume, next, previous, volume, now_playing).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "enum": ["play", "pause", "resume", "next", "previous", "volume", "launch", "now_playing"],
+                        "description": "Spotify playback or launch action.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Song name, artist, album, or playlist to search & play (used with command='play').",
+                    },
+                    "media_type": {
+                        "type": "string",
+                        "enum": ["track", "playlist", "album", "artist"],
+                        "description": "Type of Spotify item to search (default 'track').",
+                    },
+                    "volume_pct": {
+                        "type": "integer",
+                        "description": "Target volume percentage 0-100 (used with command='volume').",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
 
 
 class LLMRouter:
     """Routes compiled prompts to Player2, OpenRouter, or Demo Co-Pilot and executes tool calls."""
 
-    def __init__(self, config: AetherConfig, store: MemoryStore, executor: ActionExecutor) -> None:
+    def __init__(
+        self,
+        config: AetherConfig,
+        store: MemoryStore,
+        executor: ActionExecutor,
+        spotify: SpotifyConnector | None = None,
+    ) -> None:
         self.config = config
         self.store = store
         self.executor = executor
+        self.spotify = spotify
 
     def _player2_chat_headers(self, resource: str) -> dict[str, str]:
         """Strict Player2 headers: player2-game-key + player2-resource + optional per-call player2-suggested-model."""
@@ -188,7 +227,7 @@ class LLMRouter:
                 fleet_snapshot=fleet_snapshot,
             )
 
-        return self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
+        return await self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
 
     async def generate_calibration_briefing(self, diagnostics: dict[str, Any]) -> tuple[str, str]:
         """Deliver a sharp post-calibration ship readiness briefing honoring the calibrated persona."""
@@ -429,6 +468,26 @@ class LLMRouter:
                             )
                             saved_memories.append(mem)
                             tool_out = json.dumps({"saved": True, "id": mem["id"]})
+                        elif fn_name == "spotify_control" and self.spotify is not None:
+                            sp_cmd = str(args.get("command", "play"))
+                            sp_query = str(args.get("query", ""))
+                            sp_type = str(args.get("media_type", "track"))
+                            sp_vol = args.get("volume_pct")
+                            ok, detail, meta = await self.spotify.execute_command(
+                                command=sp_cmd,
+                                query=sp_query,
+                                media_type=sp_type,
+                                volume_pct=int(sp_vol) if sp_vol is not None else None,
+                            )
+                            rcpt = self.store.record_receipt(
+                                action_id=f"spotify:{sp_cmd}",
+                                parameters=meta,
+                                status="CONFIRMED" if ok else "FAILED",
+                                reason=detail,
+                                source=f"{provider_label}_tool",
+                            )
+                            receipts.append(rcpt)
+                            tool_out = json.dumps(rcpt)
                         else:
                             tool_out = json.dumps({"error": f"Unknown tool {fn_name}"})
 
@@ -463,11 +522,11 @@ class LLMRouter:
                     "saved_memories": saved_memories,
                 }
         except Exception as exc:
-            fallback = self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
+            fallback = await self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
             fallback["provider_used"] = f"demo_fallback ({provider_label} err: {exc.__class__.__name__})"
             return fallback
 
-    def _demo_respond(
+    async def _demo_respond(
         self,
         compiled: CompiledPrompt,
         telemetry_snapshot: dict[str, Any],
@@ -478,6 +537,39 @@ class LLMRouter:
         low = text.lower()
         receipts: list[dict[str, Any]] = []
         saved_memories: list[dict[str, Any]] = []
+
+        # Spotify voice/text intent handling in Demo Co-Pilot mode
+        if self.spotify is not None:
+            sp_play = re.search(r"(?:play|put on)\s+(.+?)(?:\s+on\s+spotify)?$", text, re.IGNORECASE)
+            if sp_play and not any(w in low for w in ["game", "star citizen"]):
+                song_query = sp_play.group(1).strip().strip("\"'")
+                ok, detail, meta = await self.spotify.execute_command("play", query=song_query)
+                rcpt = self.store.record_receipt(
+                    action_id="spotify:play",
+                    parameters=meta,
+                    status="CONFIRMED" if ok else "FAILED",
+                    reason=detail,
+                    source="demo_copilot",
+                )
+                return {
+                    "reply": detail,
+                    "provider_used": "demo",
+                    "mood": "NOMINAL" if ok else "CAUTION",
+                    "receipts": [rcpt],
+                    "saved_memories": [],
+                }
+            if any(w in low for w in ["pause spotify", "pause music", "stop music"]):
+                ok, detail, meta = await self.spotify.execute_command("pause")
+                rcpt = self.store.record_receipt("spotify:pause", meta, "CONFIRMED" if ok else "FAILED", detail, "demo_copilot")
+                return {"reply": detail, "provider_used": "demo", "mood": "NOMINAL", "receipts": [rcpt], "saved_memories": []}
+            if any(w in low for w in ["next song", "next track", "skip song", "skip track"]):
+                ok, detail, meta = await self.spotify.execute_command("next")
+                rcpt = self.store.record_receipt("spotify:next", meta, "CONFIRMED" if ok else "FAILED", detail, "demo_copilot")
+                return {"reply": detail, "provider_used": "demo", "mood": "NOMINAL", "receipts": [rcpt], "saved_memories": []}
+            if any(w in low for w in ["open spotify", "launch spotify", "fire up spotify"]):
+                ok, detail, meta = await self.spotify.execute_command("launch")
+                rcpt = self.store.record_receipt("spotify:launch", meta, "CONFIRMED" if ok else "FAILED", detail, "demo_copilot")
+                return {"reply": detail, "provider_used": "demo", "mood": "NOMINAL", "receipts": [rcpt], "saved_memories": []}
 
         mem_match = re.search(r"(?:remember(?:\s+that)?|note(?:\s+that)?)\s+(.+)", text, re.IGNORECASE)
         if mem_match:

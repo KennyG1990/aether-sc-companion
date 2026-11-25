@@ -10,9 +10,11 @@ from typing import Any
 
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .config import AetherConfig, PersonaProfile
+from .integrations.spotify import SpotifyConnector
 from .llm.router import LLMRouter
 from .rag.compiler import PromptCompiler
 from .rag.store import MemoryStore
@@ -63,6 +65,14 @@ class PersonaInterviewRequest(BaseModel):
     custom_rules: str = ""
 
 
+class SpotifyActionRequest(BaseModel):
+    command: str
+    query: str = ""
+    media_type: str = "track"
+    volume_pct: int | None = None
+    dry_run: bool = False
+
+
 class ConfigUpdateRequest(BaseModel):
     llm_provider: str | None = None
     player2_base_url: str | None = None
@@ -75,6 +85,8 @@ class ConfigUpdateRequest(BaseModel):
     elevenlabs_voice_id: str | None = None
     elevenlabs_model_id: str | None = None
     elevenlabs_api_key: str | None = None
+    spotify_client_id: str | None = None
+    spotify_redirect_uri: str | None = None
     telemetry_mode: str | None = None
     proactive_alerts_enabled: bool | None = None
     tts_enabled: bool | None = None
@@ -90,7 +102,8 @@ class AetherRuntime:
         self.simulator = TelemetrySimulator()
         self.grpc_bridge = StarCitizenGrpcBridge(self.config.grpc_target)
         self.triggers = TriggerEngine(cooldown_seconds=18.0)
-        self.llm = LLMRouter(self.config, self.store, self.executor)
+        self.spotify = SpotifyConnector(self.config)
+        self.llm = LLMRouter(self.config, self.store, self.executor, spotify=self.spotify)
         self.voice = VoiceEngine(self.config)
 
         self.recent_history: list[dict[str, str]] = []
@@ -439,9 +452,63 @@ async def get_config() -> dict[str, Any]:
     data = runtime.config.model_dump()
     data["openrouter_api_key_set"] = bool(data.pop("openrouter_api_key"))
     data["elevenlabs_api_key_set"] = bool(data.pop("elevenlabs_api_key"))
+    data.pop("spotify_access_token", None)
+    data.pop("spotify_refresh_token", None)
+    data["spotify_status"] = runtime.spotify.status_dict()
     data["grpc_status"] = runtime.grpc_bridge.status_dict()
     data["player2_status"] = await runtime.voice.probe_player2()
     return data
+
+
+@app.get("/api/spotify/status")
+def spotify_status() -> dict[str, Any]:
+    return runtime.spotify.status_dict()
+
+
+@app.get("/api/spotify/auth/start")
+def spotify_auth_start() -> dict[str, Any]:
+    return runtime.spotify.build_auth_url()
+
+
+@app.get("/api/spotify/callback", response_class=HTMLResponse)
+async def spotify_callback(code: str | None = None, state: str | None = None, error: str | None = None) -> str:
+    if error or not code or not state:
+        msg = f"Spotify authorization cancelled or failed ({error or 'missing parameters'})."
+        return (
+            "<html><body style='background:#040914;color:#fca5a5;font-family:Segoe UI,sans-serif;padding:40px;'>"
+            f"<h2>AETHER // Spotify Connector</h2><p>{msg}</p><p>You may close this tab.</p></body></html>"
+        )
+    ok, detail = await runtime.spotify.exchange_code(code, state)
+    color = "#6ee7b7" if ok else "#fca5a5"
+    return (
+        f"<html><body style='background:#040914;color:{color};font-family:Segoe UI,sans-serif;padding:40px;'>"
+        f"<h2>AETHER // Spotify Connector</h2><p>{detail}</p>"
+        "<p style='color:#94a3b8'>You can close this tab and return to AETHER — voice playback is ready!</p></body></html>"
+    )
+
+
+@app.post("/api/spotify/action")
+async def spotify_action(req: SpotifyActionRequest) -> dict[str, Any]:
+    ok, detail, meta = await runtime.spotify.execute_command(
+        command=req.command,
+        query=req.query,
+        media_type=req.media_type,
+        volume_pct=req.volume_pct,
+        dry_run=req.dry_run,
+    )
+    return runtime.store.record_receipt(
+        action_id=f"spotify:{req.command}",
+        parameters=meta,
+        status="CONFIRMED" if ok else "FAILED",
+        reason=detail,
+        source="ui_spotify",
+    )
+
+
+@app.post("/api/spotify/disconnect")
+def spotify_disconnect() -> dict[str, Any]:
+    runtime.spotify.disconnect()
+    return runtime.spotify.status_dict()
 
 
 @app.post("/api/config")

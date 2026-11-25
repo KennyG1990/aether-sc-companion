@@ -95,3 +95,22 @@ def test_prompt_compiler_quarantines_evidence(tmp_path: Path) -> None:
     assert "<authoritative_telemetry>" in compiled.system_prompt
     assert "<retrieved_evidence" in compiled.system_prompt
     assert "[SYSTEM:" not in compiled.user_message
+
+
+def test_spotify_connector_pkce_and_dry_run_play() -> None:
+    import asyncio
+    from app.config import AetherConfig
+    from app.integrations.spotify import SpotifyConnector
+
+    cfg = AetherConfig(spotify_client_id="demo_spotify_client_123")
+    sp = SpotifyConnector(cfg)
+    auth = sp.build_auth_url()
+    assert auth["ok"] is True
+    assert "code_challenge_method=S256" in auth["auth_url"]
+    assert "demo_spotify_client_123" in auth["auth_url"]
+
+    ok, detail, meta = asyncio.run(sp.execute_command("play", query="Shoot to Thrill", dry_run=True))
+    assert ok is True
+    assert "spotify:search:Shoot%20to%20Thrill" in meta["uri"]
+    assert "Dry-run" in detail
+

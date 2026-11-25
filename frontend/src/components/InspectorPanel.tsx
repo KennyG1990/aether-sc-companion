@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Sparkles, HeartPulse } from "lucide-react";
+import { Sparkles, HeartPulse, Music } from "lucide-react";
 import {
   ActionReceipt,
   AetherConfigData,
@@ -66,6 +66,9 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   const [elevenKey, setElevenKey] = useState("");
   const [telemetryMode, setTelemetryMode] = useState("simulator");
   const [wakeWordEnabled, setWakeWordEnabled] = useState(true);
+  const [spotifyClientId, setSpotifyClientId] = useState("");
+  const [spotifyTestSong, setSpotifyTestSong] = useState("Shoot to Thrill AC/DC");
+  const [spotifyNotice, setSpotifyNotice] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
 
   // Persona edit state
@@ -83,6 +86,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
       setElevenModelId(config.elevenlabs_model_id || "eleven_multilingual_v2");
       setTelemetryMode(config.telemetry_mode);
       setWakeWordEnabled(config.wake_word_enabled);
+      setSpotifyClientId(config.spotify_client_id || "");
       setPersonaDraft(config.persona);
     }
   }, [config]);
@@ -151,6 +155,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
       tts_provider: ttsProvider,
       elevenlabs_voice_id: voiceId,
       elevenlabs_model_id: elevenModelId,
+      spotify_client_id: spotifyClientId.trim(),
       telemetry_mode: telemetryMode,
       wake_word_enabled: wakeWordEnabled,
     };
@@ -164,6 +169,32 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
     await onRefreshVoices(ttsProvider);
     setSaveNotice("Configuration saved locally!");
     window.setTimeout(() => setSaveNotice(null), 2600);
+  };
+
+  const connectSpotifyOAuth = async () => {
+    if (spotifyClientId.trim()) {
+      await onSaveConfig({ spotify_client_id: spotifyClientId.trim() });
+    }
+    const res = await fetch("/api/spotify/auth/start");
+    const data = await res.json();
+    if (data.ok && data.auth_url) {
+      window.open(data.auth_url, "_blank", "noopener,noreferrer");
+      setSpotifyNotice("Opened Spotify OAuth login tab. Complete sign-in, then refresh Config.");
+    } else {
+      setSpotifyNotice(data.error || "Enter a Spotify Client ID first.");
+    }
+  };
+
+  const runSpotifyQuick = async (command: string, query = "") => {
+    const res = await fetch("/api/spotify/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command, query }),
+    });
+    if (res.ok) {
+      const rcpt = await res.json();
+      setSpotifyNotice(rcpt.reason);
+    }
   };
 
   const barClass = (pct: number) => (pct < 30 ? "crit" : pct < 60 ? "warn" : "");
@@ -640,6 +671,86 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
               </div>
               {saveNotice && (
                 <div style={{ fontSize: 11, color: "#6ee7b7", marginTop: 6, textAlign: "center" }}>{saveNotice}</div>
+              )}
+            </div>
+
+            <div className="card">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <div className="card-title" style={{ marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                  <Music size={12} color="#10b981" /> 4. Spotify Connector
+                </div>
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: config?.spotify_status?.oauth_connected ? "#6ee7b7" : "#38bdf8",
+                  }}
+                >
+                  {config?.spotify_status?.oauth_connected ? "WEB API CONNECTED" : "LOCAL LAUNCHER READY"}
+                </span>
+              </div>
+
+              <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.45, marginBottom: 8 }}>
+                Say <strong>"Hey {config?.persona.ai_name || "Aether"}, play [song]"</strong> anytime! Works out of the
+                box via Windows Spotify URI, or connect a free Spotify Client ID for instant Web API auto-play &amp;
+                volume control.
+              </div>
+
+              <div className="field-group">
+                <label>Spotify Client ID (Optional OAuth PKCE)</label>
+                <input
+                  className="text-input"
+                  placeholder="Paste Client ID from developer.spotify.com"
+                  value={spotifyClientId}
+                  onChange={(e) => setSpotifyClientId(e.target.value)}
+                />
+              </div>
+              <div style={{ fontSize: 10, color: "#7ea3c4", marginBottom: 8 }}>
+                Redirect URI: <code>{config?.spotify_status?.redirect_uri || "http://127.0.0.1:8785/api/spotify/callback"}</code>
+              </div>
+
+              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                <button className="btn active" style={{ flex: 1, justifyContent: "center" }} onClick={connectSpotifyOAuth}>
+                  {config?.spotify_status?.oauth_connected ? "RECONNECT SPOTIFY" : "CONNECT SPOTIFY (OAUTH)"}
+                </button>
+                {config?.spotify_status?.oauth_connected && (
+                  <button
+                    className="btn danger"
+                    onClick={async () => {
+                      await fetch("/api/spotify/disconnect", { method: "POST" });
+                      await onSaveConfig({});
+                      setSpotifyNotice("Disconnected Spotify Web API (Local Launcher still active).");
+                    }}
+                  >
+                    DISCONNECT
+                  </button>
+                )}
+              </div>
+
+              <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                <input
+                  className="text-input"
+                  value={spotifyTestSong}
+                  onChange={(e) => setSpotifyTestSong(e.target.value)}
+                  placeholder="Song or playlist..."
+                />
+                <button className="btn" onClick={() => runSpotifyQuick("play", spotifyTestSong)}>
+                  PLAY
+                </button>
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button className="btn" style={{ flex: 1, justifyContent: "center" }} onClick={() => runSpotifyQuick("launch")}>
+                  LAUNCH
+                </button>
+                <button className="btn" style={{ flex: 1, justifyContent: "center" }} onClick={() => runSpotifyQuick("pause")}>
+                  PAUSE
+                </button>
+                <button className="btn" style={{ flex: 1, justifyContent: "center" }} onClick={() => runSpotifyQuick("next")}>
+                  NEXT
+                </button>
+              </div>
+              {spotifyNotice && (
+                <div style={{ fontSize: 11, color: "#6ee7b7", marginTop: 6, lineHeight: 1.4 }}>{spotifyNotice}</div>
               )}
             </div>
           </>

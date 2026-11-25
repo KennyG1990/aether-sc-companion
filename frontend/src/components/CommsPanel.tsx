@@ -56,9 +56,9 @@ export const CommsPanel: React.FC<CommsPanelProps> = ({
   const quickPrompts = [
     `Hey ${aiName}`,
     "Hey John, pass the salt",
+    `Hey ${aiName}, play Shoot to Thrill`,
     `Hey ${aiName}, drop landing gear`,
     `Hey ${aiName}, tell me a joke`,
-    `Hey ${aiName}, where are our allies?`,
     `Hey ${aiName}, self destruct`,
   ];
 

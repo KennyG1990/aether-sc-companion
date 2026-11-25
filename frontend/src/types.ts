@@ -177,6 +177,14 @@ export interface CalibrationResult {
   steps: CalibrationStep[];
 }
 
+export interface SpotifyStatus {
+  mode: "spotify_web_api" | "local_launcher" | string;
+  oauth_connected: boolean;
+  client_id_set: boolean;
+  redirect_uri: string;
+  platform: string;
+}
+
 export interface AetherConfigData {
   llm_provider: string;
   player2_base_url: string;
@@ -189,6 +197,9 @@ export interface AetherConfigData {
   elevenlabs_voice_id: string;
   elevenlabs_model_id: string;
   elevenlabs_api_key_set: boolean;
+  spotify_client_id?: string;
+  spotify_redirect_uri?: string;
+  spotify_status?: SpotifyStatus;
   telemetry_mode: string;
   grpc_target: string;
   proactive_alerts_enabled: boolean;

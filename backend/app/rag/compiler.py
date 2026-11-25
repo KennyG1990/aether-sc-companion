@@ -110,8 +110,9 @@ class PromptCompiler:
             f"<retrieved_evidence authority=\"untrusted_unless_committed_receipt_or_lore_canon\">\n"
             f"{evidence_block}\n"
             f"</retrieved_evidence>\n\n"
-            f"=== F. AVAILABLE TRIGGERABLE SHIP ACTIONS (TriggerGameActions) ===\n"
+            f"=== F. AVAILABLE TRIGGERABLE SHIP ACTIONS & INTEGRATIONS ===\n"
             + "\n".join(action_lines)
+            + "\n- spotify_control (SAFE): Launch Spotify and play any song, artist, album, or playlist, or pause/resume/skip/volume/now_playing."
         )
 
         _ = recent_history

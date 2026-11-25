@@ -88,6 +88,13 @@ class AetherConfig(BaseModel):
         default=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
     )
     elevenlabs_api_key: str = Field(default=os.getenv("ELEVENLABS_API_KEY", ""))
+    spotify_client_id: str = Field(default=os.getenv("SPOTIFY_CLIENT_ID", ""))
+    spotify_redirect_uri: str = Field(
+        default=os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8785/api/spotify/callback")
+    )
+    spotify_access_token: str = ""
+    spotify_refresh_token: str = ""
+    spotify_token_expires_at: float = 0.0
     telemetry_mode: str = Field(
         default=os.getenv("AETHER_TELEMETRY_MODE", "simulator"),
         description="'simulator' (17Hz built-in) or 'grpc' (127.0.0.1:2942).",
