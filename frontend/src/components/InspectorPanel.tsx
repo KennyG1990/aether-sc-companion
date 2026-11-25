@@ -13,6 +13,8 @@ import {
 } from "../types";
 
 interface InspectorPanelProps {
+  activeTab: "systems" | "rag" | "receipts" | "persona" | "config";
+  onTabChange: (tab: "systems" | "rag" | "receipts" | "persona" | "config") => void;
   ship: ShipTelemetry;
   config: AetherConfigData | null;
   heartbeat: HeartbeatState | null;
@@ -34,6 +36,8 @@ interface InspectorPanelProps {
 }
 
 export const InspectorPanel: React.FC<InspectorPanelProps> = ({
+  activeTab: tab,
+  onTabChange: setTab,
   ship,
   config,
   heartbeat,
@@ -53,7 +57,6 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   onTestVoice,
   refreshTick,
 }) => {
-  const [tab, setTab] = useState<"systems" | "rag" | "receipts" | "persona" | "config">("config");
   const [memories, setMemories] = useState<RetrievedMemoryHit[]>([]);
   const [ragQuery, setRagQuery] = useState("");
   const [newMem, setNewMem] = useState("");

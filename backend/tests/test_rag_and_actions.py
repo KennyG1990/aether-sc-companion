@@ -114,3 +114,82 @@ def test_spotify_connector_pkce_and_dry_run_play() -> None:
     assert "spotify:search:Shoot%20to%20Thrill" in meta["uri"]
     assert "Dry-run" in detail
 
+
+def test_settings_safeguards_block_keys_and_exe_but_allow_safe_settings(tmp_path: Path, monkeypatch) -> None:
+    from app.config import AetherConfig
+    from app.llm.router import LLMRouter
+
+    store = MemoryStore(str(tmp_path / "safe.db"))
+    executor = ActionExecutor(store)
+    monkeypatch.setattr(AetherConfig, "save_to_disk", lambda self: None)
+    cfg = AetherConfig(
+        openrouter_api_key="",
+        elevenlabs_api_key="",
+        star_citizen_exe_path=r"G:\StarCitizen\LIVE\Bin64\StarCitizen.exe",
+    )
+    router = LLMRouter(cfg, store, executor)
+
+    # Attempt to overwrite protected keys & StarCitizen.exe must be hard-blocked!
+    rcpt_block, _ = router._execute_control_settings(
+        {
+            "updates": {
+                "openrouter_api_key": "sk-evil",
+                "elevenlabs_api_key": "xi-evil",
+                "star_citizen_exe_path": r"C:\evil.exe",
+                "player2_game_key": "00000000",
+                "llm_provider": "openrouter",
+                "tts_provider": "elevenlabs_direct",
+            }
+        },
+        "test",
+    )
+    assert rcpt_block["status"] == "BLOCKED_SAFEGUARD"
+    assert cfg.openrouter_api_key == ""
+    assert cfg.elevenlabs_api_key == ""
+    assert cfg.star_citizen_exe_path == r"G:\StarCitizen\LIVE\Bin64\StarCitizen.exe"
+    assert cfg.llm_provider != "openrouter"
+    assert cfg.tts_provider != "elevenlabs_direct"
+
+    # Safe voice-controlled settings + UI navigation must succeed cleanly!
+    rcpt_ok, cmds = router._execute_control_settings(
+        {
+            "ui_action": "switch_tab",
+            "tab": "config",
+            "updates": {
+                "pilot_name": "Maverick",
+                "wake_word_enabled": False,
+                "humor_style": "Dry sarcastic spacer banter",
+            },
+        },
+        "test",
+    )
+    assert rcpt_ok["status"] == "CONFIRMED"
+    assert cfg.persona.pilot_name == "Maverick"
+    assert cfg.wake_word_enabled is False
+    assert any(c.get("type") == "ui_nav" and c.get("tab") == "config" for c in cmds)
+    assert any(c.get("type") == "config_updated" for c in cmds)
+
+
+def test_hologram_director_focuses_friend_and_self(tmp_path: Path) -> None:
+    from app.config import AetherConfig
+    from app.llm.router import LLMRouter
+
+    store = MemoryStore(str(tmp_path / "holo.db"))
+    sim = TelemetrySimulator()
+    executor = ActionExecutor(store)
+    cfg = AetherConfig()
+    router = LLMRouter(cfg, store, executor)
+
+    fleet = [a.model_dump() for a in sim.allies.values()]
+    rcpt, cmds = router._execute_control_hologram(
+        {"action": "focus_ally", "target": "Kestrel"},
+        sim.ship.model_dump(),
+        fleet,
+        "test",
+    )
+    assert rcpt["status"] == "CONFIRMED"
+    assert cmds[0]["type"] == "hologram_command"
+    assert cmds[0]["action"] == "focus_ally"
+    assert cmds[0]["target"] == "Kestrel"
+
+

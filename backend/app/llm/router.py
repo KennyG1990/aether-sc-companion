@@ -17,6 +17,7 @@ from ..integrations.spotify import SpotifyConnector
 from ..rag.compiler import CompiledPrompt
 from ..rag.store import MemoryStore
 from ..telemetry.actions import ActionExecutor
+from ..voice.tts import VoiceEngine
 
 JOKES = [
     "Why did the Drake Corsair pilot bring duct tape to Orison? Because structural integrity is more of a suggestion than a feature.",
@@ -104,7 +105,142 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "change_voice",
+            "description": "Change AETHER's live ElevenLabs / Player2 speaking voice on the fly. Use whenever the pilot asks for a specific voice/accent/gender ('British man', 'female narrator', 'Australian', a voice name) OR asks 'what do you want to sound like?' (pass query='choose_for_myself'). The very next spoken reply immediately uses the newly chosen voice!",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Requested voice style, accent, gender, name (e.g. 'British man', 'warm female', 'Adam'), or 'choose_for_myself' to autonomously pick a voice.",
+                    },
+                    "tts_provider": {
+                        "type": "string",
+                        "enum": ["player2_elevenlabs", "elevenlabs_direct"],
+                        "description": "Optional voice source override. Only pass if the user explicitly asks to switch between Player2 voices and their own ElevenLabs account.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "control_hologram",
+            "description": "Control AETHER's Star Citizen 3D Holographic Map & Camera. IMPORTANT: focus_self, focus_ally, and focus_planet AUTOMATICALLY open the hologram AND fly/zoom in a SINGLE call! Always use action='focus_ally' (with target='Kestrel' or 'friend') whenever asked to find/show/snap to a friend, action='focus_self' whenever asked 'where are we?' or 'show our grid', and action='zoom_out'/'zoom_in' (with steps=1..3) for zoom commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "open",
+                            "close",
+                            "focus_self",
+                            "focus_ally",
+                            "focus_planet",
+                            "zoom_in",
+                            "zoom_out",
+                            "reset_view",
+                            "set_view_mode",
+                        ],
+                        "description": "Hologram view or camera command.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Ally callsign/pilot/ship name (for focus_ally, or 'friend' for primary ally) or Stanton planet/moon name (for focus_planet).",
+                    },
+                    "steps": {
+                        "type": "integer",
+                        "description": "Zoom steps (1 for normal zoom in/out, 2 for 'zoom out more', 3 for full pullback). Default 1.",
+                    },
+                    "view_mode": {
+                        "type": "string",
+                        "enum": ["fleet", "ship"],
+                        "description": "For set_view_mode: 'fleet' (Stanton System & Friends Holo-Map) or 'ship' (Own-Ship 3D Wireframe).",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "control_settings",
+            "description": "Open/close AETHER's Settings modal, navigate to any tab (config, persona, systems, rag, receipts), and safely write settings by voice so the pilot never has to click. Protected credentials (API keys, Player2 Mod ID/URL, OAuth tokens) and StarCitizen.exe path are safeguarded and cannot be modified.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ui_action": {
+                        "type": "string",
+                        "enum": [
+                            "open_settings",
+                            "close_settings",
+                            "switch_tab",
+                            "start_calibration",
+                            "open_personality_interview",
+                            "none",
+                        ],
+                        "description": "Optional UI navigation command.",
+                    },
+                    "tab": {
+                        "type": "string",
+                        "enum": ["config", "persona", "systems", "rag", "receipts"],
+                        "description": "Target tab inside Settings modal.",
+                    },
+                    "updates": {
+                        "type": "object",
+                        "description": "Safe key-value settings to update. Allowed keys: ai_name, pilot_name, tone, verbosity, question_style, humor_style, custom_rules, persona_summary, pilot_callsign, ship_name, wake_word_enabled, proactive_alerts_enabled, tts_enabled, tts_provider, elevenlabs_model_id, llm_provider, player2_model, openrouter_model, telemetry_mode.",
+                    },
+                },
+            },
+        },
+    },
 ]
+
+# HARD IMMUTABLE SAFEGUARD LIST — LLM can NEVER modify credentials, endpoints, DB, or StarCitizen.exe!
+PROTECTED_SETTING_KEYS = frozenset(
+    {
+        "openrouter_api_key",
+        "elevenlabs_api_key",
+        "player2_game_key",
+        "player2_base_url",
+        "player2_mcp_url",
+        "star_citizen_exe_path",
+        "grpc_target",
+        "spotify_client_id",
+        "spotify_redirect_uri",
+        "spotify_access_token",
+        "spotify_refresh_token",
+        "spotify_token_expires_at",
+        "db_path",
+        "api_key",
+        "exe_path",
+        "game_exe",
+    }
+)
+
+PERSONA_SETTING_KEYS = frozenset(
+    {
+        "ai_name",
+        "pilot_name",
+        "tone",
+        "verbosity",
+        "question_style",
+        "humor_style",
+        "custom_rules",
+        "persona_summary",
+    }
+)
+
+VALID_ELEVENLABS_MODELS = frozenset(
+    {"eleven_multilingual_v2", "eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_monolingual_v1"}
+)
 
 
 class LLMRouter:
@@ -116,11 +252,13 @@ class LLMRouter:
         store: MemoryStore,
         executor: ActionExecutor,
         spotify: SpotifyConnector | None = None,
+        voice: VoiceEngine | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.executor = executor
         self.spotify = spotify
+        self.voice = voice
 
     def _player2_chat_headers(self, resource: str) -> dict[str, str]:
         """Strict Player2 headers: player2-game-key + player2-resource + optional per-call player2-suggested-model."""
@@ -477,6 +615,7 @@ class LLMRouter:
 
         receipts: list[dict[str, Any]] = []
         saved_memories: list[dict[str, Any]] = []
+        ui_commands: list[dict[str, Any]] = []
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -485,9 +624,10 @@ class LLMRouter:
                     return {
                         "reply": f"Player2 Joules balance depleted, {self.config.persona.pilot_name}. Top up in the Player2 App (player2://ai-power) or switch to OpenRouter in Config.",
                         "provider_used": f"{provider_label} (402 low joules)",
-                        "mood": "CAUTION",
+                        "mood": "FOCUSED",
                         "receipts": [],
                         "saved_memories": [],
+                        "ui_commands": [],
                     }
                 resp.raise_for_status()
                 data = resp.json()
@@ -548,6 +688,23 @@ class LLMRouter:
                             )
                             receipts.append(rcpt)
                             tool_out = json.dumps(rcpt)
+                        elif fn_name == "change_voice" and self.voice is not None:
+                            rcpt, cmds = await self._execute_change_voice(args, provider_label)
+                            receipts.append(rcpt)
+                            ui_commands.extend(cmds)
+                            tool_out = json.dumps(rcpt)
+                        elif fn_name == "control_hologram":
+                            rcpt, cmds = self._execute_control_hologram(
+                                args, telemetry_snapshot, fleet_snapshot, provider_label
+                            )
+                            receipts.append(rcpt)
+                            ui_commands.extend(cmds)
+                            tool_out = json.dumps(rcpt)
+                        elif fn_name == "control_settings":
+                            rcpt, cmds = self._execute_control_settings(args, provider_label)
+                            receipts.append(rcpt)
+                            ui_commands.extend(cmds)
+                            tool_out = json.dumps(rcpt)
                         else:
                             tool_out = json.dumps({"error": f"Unknown tool {fn_name}"})
 
@@ -569,7 +726,13 @@ class LLMRouter:
 
                     followup = await client.post(base_url, headers=headers, json=followup_payload)
                     followup.raise_for_status()
-                    reply_text = (followup.json()["choices"][0]["message"].get("content") or "Action processed.").strip()
+                    raw_followup = (followup.json()["choices"][0]["message"].get("content") or "").strip()
+                    if raw_followup:
+                        reply_text = raw_followup
+                    elif receipts:
+                        reply_text = receipts[-1].get("reason") or "Done."
+                    else:
+                        reply_text = f"Done, {self.config.persona.pilot_name}."
                 else:
                     reply_text = (choice.get("content") or f"Standing by, {self.config.persona.pilot_name}.").strip()
 
@@ -585,11 +748,231 @@ class LLMRouter:
                     "mood": mood,
                     "receipts": receipts,
                     "saved_memories": saved_memories,
+                    "ui_commands": ui_commands,
                 }
         except Exception as exc:
             fallback = await self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
             fallback["provider_used"] = f"demo_fallback ({provider_label} err: {exc.__class__.__name__})"
             return fallback
+
+    async def _execute_change_voice(
+        self, args: dict[str, Any], provider_label: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        query = str(args.get("query") or "choose_for_myself")
+        tts_provider = args.get("tts_provider")
+        ok, detail, meta = await self.voice.find_and_set_voice(  # type: ignore[union-attr]
+            query=query,
+            tts_provider=str(tts_provider) if tts_provider else None,
+        )
+        rcpt = self.store.record_receipt(
+            action_id="voice:change",
+            parameters=meta,
+            status="CONFIRMED" if ok else "FAILED",
+            reason=detail,
+            source=f"{provider_label}_tool",
+        )
+        cmds: list[dict[str, Any]] = []
+        if ok:
+            cmds.append({"type": "config_updated", "voice": meta})
+        return rcpt, cmds
+
+    def _execute_control_hologram(
+        self,
+        args: dict[str, Any],
+        telemetry_snapshot: dict[str, Any],
+        fleet_snapshot: list[dict[str, Any]],
+        provider_label: str,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        action = str(args.get("action") or "open").strip().lower()
+        target = str(args.get("target") or "").strip()
+        steps = max(1, min(4, int(args.get("steps") or 1)))
+        view_mode = str(args.get("view_mode") or "fleet").strip().lower()
+
+        # Smart auto-upgrade: if caller passes action='open' WITH a target, focus that target directly!
+        if action == "open" and target:
+            t_low = target.lower()
+            is_ally = t_low in {"friend", "my friend", "ally", "wingman"} or any(
+                t_low in f"{a.get('callsign','')} {a.get('pilot_name','')} {a.get('ship_name','')}".lower()
+                for a in fleet_snapshot
+            )
+            action = "focus_ally" if is_ally else "focus_planet"
+
+        resolved_target = target
+        detail = f"Hologram command '{action}' dispatched."
+
+        if action == "focus_self":
+            planet = str(telemetry_snapshot.get("planet") or "Crusader")
+            zone = str(telemetry_snapshot.get("zone") or f"{planet} Orbit")
+            resolved_target = planet
+            detail = f"Opened Star Citizen holo-map and zoomed into your live ship grid at {zone}."
+        elif action == "focus_ally":
+            matched = None
+            t_low = target.lower()
+            # 1. Exact/substring match on callsign, pilot name, ship name, or squad
+            if t_low and t_low not in {"friend", "my friend", "ally", "wingman", "buddy", "squadmate", "teammate"}:
+                for a in fleet_snapshot:
+                    blob = f"{a.get('callsign','')} {a.get('pilot_name','')} {a.get('ship_name','')} {a.get('squad','')}".lower()
+                    if t_low in blob:
+                        matched = a
+                        break
+            # 2. Generic "my friend" -> prioritize real relayed friend clients first, else first active ally
+            if matched is None and fleet_snapshot:
+                relayed = [a for a in fleet_snapshot if a.get("relay_source") not in (None, "", "simulator")]
+                matched = relayed[0] if relayed else fleet_snapshot[0]
+
+            if matched:
+                resolved_target = str(matched["callsign"])
+                detail = (
+                    f"Snapped hologram to connected ally {matched['callsign']} ({matched['ship_name']}) "
+                    f"in {matched['zone']} — shields {matched['shields_pct']:.0f}%, status {matched['status']}."
+                )
+            else:
+                detail = "Opened hologram, but no allied vessels are currently connected to the fleet relay."
+        elif action == "focus_planet":
+            resolved_target = target or str(telemetry_snapshot.get("planet") or "Crusader")
+            detail = f"Focused Star Citizen Stanton holo-map on {resolved_target}."
+        elif action == "zoom_in":
+            detail = f"Zoomed holo-map closer ({steps} step{'s' if steps > 1 else ''})."
+        elif action == "zoom_out":
+            detail = f"Zoomed holo-map further out ({steps} step{'s' if steps > 1 else ''})."
+        elif action == "reset_view":
+            detail = "Reset holo-map to full Stanton system overview."
+        elif action == "open":
+            detail = "Switched display to Star Citizen 3D Hologram view."
+        elif action == "close":
+            detail = "Returned display to AETHER acoustic core view."
+        elif action == "set_view_mode":
+            detail = f"Switched hologram projection to {'Own Ship Tactical Wireframe' if view_mode == 'ship' else 'Stanton Fleet Hologram'}."
+
+        cmd = {
+            "type": "hologram_command",
+            "action": action,
+            "target": resolved_target,
+            "steps": steps,
+            "view_mode": view_mode,
+        }
+        rcpt = self.store.record_receipt(
+            action_id=f"hologram:{action}",
+            parameters={"target": resolved_target, "steps": steps, "view_mode": view_mode},
+            status="CONFIRMED",
+            reason=detail,
+            source=f"{provider_label}_tool",
+        )
+        return rcpt, [cmd]
+
+    def _execute_control_settings(
+        self, args: dict[str, Any], provider_label: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        ui_action = str(args.get("ui_action") or "none").strip().lower()
+        tab = str(args.get("tab") or "").strip().lower()
+        updates = args.get("updates") if isinstance(args.get("updates"), dict) else {}
+
+        cmds: list[dict[str, Any]] = []
+        applied: dict[str, Any] = {}
+        blocked: list[str] = []
+        notes: list[str] = []
+
+        if ui_action in {"open_settings", "close_settings", "switch_tab", "start_calibration", "open_personality_interview"}:
+            cmds.append({"type": "ui_nav", "action": ui_action, "tab": tab or None})
+            notes.append(f"UI -> {ui_action}" + (f" ({tab})" if tab else ""))
+        elif tab in {"config", "persona", "systems", "rag", "receipts"}:
+            cmds.append({"type": "ui_nav", "action": "switch_tab", "tab": tab})
+            notes.append(f"Opened Settings -> {tab}")
+
+        def _is_protected(k: str) -> bool:
+            kl = k.lower().strip()
+            if kl in PROTECTED_SETTING_KEYS:
+                return True
+            return any(tok in kl for tok in ("api_key", "secret", "token", "exe", "game_key", "base_url", "mcp_url", "grpc_target", "db_path"))
+
+        for raw_key, val in updates.items():
+            key = str(raw_key).strip()
+            if _is_protected(key):
+                blocked.append(f"{key} (protected safeguard — edit manually)")
+                continue
+
+            if key in PERSONA_SETTING_KEYS:
+                sval = str(val).strip()
+                if not sval or len(sval) > 300:
+                    blocked.append(f"{key} (invalid empty/oversized value)")
+                    continue
+                if key in {"ai_name", "pilot_name"} and len(sval) > 32:
+                    sval = sval[:32]
+                setattr(self.config.persona, key, sval)
+                applied[key] = sval
+            elif key in {"pilot_callsign", "ship_name"}:
+                sval = str(val).strip()[:64]
+                if sval:
+                    setattr(self.config, key, sval)
+                    applied[key] = sval
+            elif key in {"wake_word_enabled", "proactive_alerts_enabled", "tts_enabled"}:
+                bval = val if isinstance(val, bool) else str(val).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+                setattr(self.config, key, bval)
+                applied[key] = bval
+            elif key == "telemetry_mode":
+                mode = str(val).strip().lower()
+                if mode in {"simulator", "grpc"}:
+                    self.config.telemetry_mode = mode
+                    applied[key] = mode
+                else:
+                    blocked.append(f"telemetry_mode='{mode}' (must be 'simulator' or 'grpc')")
+            elif key == "llm_provider":
+                prov = str(val).strip().lower()
+                if prov == "openrouter" and not self.config.openrouter_api_key:
+                    blocked.append("llm_provider='openrouter' (safeguard: OpenRouter API key is not configured)")
+                elif prov in {"player2", "openrouter", "demo"}:
+                    self.config.llm_provider = prov
+                    applied[key] = prov
+                else:
+                    blocked.append(f"llm_provider='{prov}' (unsupported)")
+            elif key == "tts_provider":
+                tprov = str(val).strip().lower()
+                if tprov == "elevenlabs_direct" and not self.config.elevenlabs_api_key:
+                    blocked.append("tts_provider='elevenlabs_direct' (safeguard: ElevenLabs API key is not configured)")
+                elif tprov in {"player2_elevenlabs", "elevenlabs_direct", "browser"}:
+                    self.config.tts_provider = tprov
+                    applied[key] = tprov
+                else:
+                    blocked.append(f"tts_provider='{tprov}' (unsupported)")
+            elif key == "player2_model":
+                sval = str(val).strip()
+                self.config.player2_model = "" if sval.lower() in {"default", "auto", "none"} else sval
+                applied[key] = self.config.player2_model or "(Player2 Default)"
+            elif key == "openrouter_model":
+                sval = str(val).strip()
+                if "/" in sval and len(sval) <= 100:
+                    self.config.openrouter_model = sval
+                    applied[key] = sval
+                else:
+                    blocked.append("openrouter_model (must be valid vendor/model format)")
+            elif key == "elevenlabs_model_id":
+                sval = str(val).strip()
+                if sval in VALID_ELEVENLABS_MODELS:
+                    self.config.elevenlabs_model_id = sval
+                    applied[key] = sval
+                else:
+                    blocked.append(f"elevenlabs_model_id='{sval}' (invalid ElevenLabs model)")
+            else:
+                blocked.append(f"{key} (unknown or safeguarded setting)")
+
+        if applied:
+            self.config.save_to_disk()
+            cmds.append({"type": "config_updated", "applied": applied})
+            notes.append("Updated: " + ", ".join(f"{k}={v}" for k, v in applied.items()))
+
+        if blocked:
+            notes.append("Blocked by safeguard: " + "; ".join(blocked))
+
+        status = "BLOCKED_SAFEGUARD" if (blocked and not applied and not cmds) else "CONFIRMED"
+        detail = " | ".join(notes) if notes else "No setting changes requested."
+        rcpt = self.store.record_receipt(
+            action_id="settings:control",
+            parameters={"ui_action": ui_action, "tab": tab, "applied": applied, "blocked": blocked},
+            status=status,
+            reason=detail,
+            source=f"{provider_label}_tool",
+        )
+        return rcpt, cmds
 
     async def _demo_respond(
         self,
@@ -602,6 +985,58 @@ class LLMRouter:
         low = text.lower()
         receipts: list[dict[str, Any]] = []
         saved_memories: list[dict[str, Any]] = []
+
+        # Voice change intent in Demo mode
+        if self.voice is not None and any(
+            kw in low for kw in ["change your voice", "switch your voice", "sound like", "new voice", "what do you want to sound"]
+        ):
+            q = "choose_for_myself" if "what do you want" in low else text
+            rcpt, cmds = await self._execute_change_voice({"query": q}, "demo")
+            return {
+                "reply": "I want to sound like this." if "what do you want" in low else f"Done, {p.pilot_name}. {rcpt['reason']}",
+                "provider_used": "demo",
+                "mood": "HAPPY",
+                "receipts": [rcpt],
+                "saved_memories": [],
+                "ui_commands": cmds,
+            }
+
+        # Hologram navigation & zoom intent in Demo mode
+        if any(kw in low for kw in ["hologram", "holo map", "holo-map", "where are we", "zoom in", "zoom out", "bring up my friend", "where's my friend", "where is my friend"]):
+            if "zoom out" in low:
+                rcpt, cmds = self._execute_control_hologram({"action": "zoom_out", "steps": 2 if "more" in low else 1}, telemetry_snapshot, fleet_snapshot, "demo")
+            elif "zoom in" in low:
+                rcpt, cmds = self._execute_control_hologram({"action": "zoom_in", "steps": 2 if "more" in low else 1}, telemetry_snapshot, fleet_snapshot, "demo")
+            elif "friend" in low or "ally" in low:
+                rcpt, cmds = self._execute_control_hologram({"action": "focus_ally", "target": "friend"}, telemetry_snapshot, fleet_snapshot, "demo")
+            elif "where are we" in low or "our grid" in low:
+                rcpt, cmds = self._execute_control_hologram({"action": "focus_self"}, telemetry_snapshot, fleet_snapshot, "demo")
+            elif "close" in low:
+                rcpt, cmds = self._execute_control_hologram({"action": "close"}, telemetry_snapshot, fleet_snapshot, "demo")
+            else:
+                rcpt, cmds = self._execute_control_hologram({"action": "open"}, telemetry_snapshot, fleet_snapshot, "demo")
+            return {
+                "reply": rcpt["reason"],
+                "provider_used": "demo",
+                "mood": "CURIOUS",
+                "receipts": [rcpt],
+                "saved_memories": [],
+                "ui_commands": cmds,
+            }
+
+        # Settings UI intent in Demo mode
+        if any(kw in low for kw in ["open settings", "open up the settings", "go to config", "close settings"]):
+            tab = "config" if "config" in low else "persona" if "persona" in low else "systems" if "ship" in low or "sim" in low else "receipts" if "receipt" in low else "rag" if "rag" in low or "memory" in low else ""
+            act = "close_settings" if "close settings" in low else ("switch_tab" if tab else "open_settings")
+            rcpt, cmds = self._execute_control_settings({"ui_action": act, "tab": tab}, "demo")
+            return {
+                "reply": f"Settings updated, {p.pilot_name}. {rcpt['reason']}",
+                "provider_used": "demo",
+                "mood": "CALM",
+                "receipts": [rcpt],
+                "saved_memories": [],
+                "ui_commands": cmds,
+            }
 
         # Spotify voice/text intent handling in Demo Co-Pilot mode
         if self.spotify is not None:

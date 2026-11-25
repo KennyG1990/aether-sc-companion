@@ -17,7 +17,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { JarvisCore3D } from "./components/JarvisCore3D";
-import { HoloDeck3D } from "./components/HoloDeck3D";
+import { HoloDeck3D, HologramCommand } from "./components/HoloDeck3D";
 import { CalibrationOverlay } from "./components/CalibrationOverlay";
 import { SettingsModal } from "./components/SettingsModal";
 import { parseWakeWord } from "./utils/wakeWord";
@@ -101,6 +101,8 @@ const DEFAULT_PERSONA: PersonaProfile = {
 export default function App() {
   const [stageMode, setStageMode] = useState<"core" | "hologram">("core");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"systems" | "rag" | "receipts" | "persona" | "config">("config");
+  const [holoCommand, setHoloCommand] = useState<HologramCommand | null>(null);
 
   const [ship, setShip] = useState<ShipTelemetry>(DEFAULT_SHIP);
   const [fleet, setFleet] = useState<AllyShipState[]>([]);
@@ -139,6 +141,8 @@ export default function App() {
 
   const micControllerRef = useRef<AetherMicController | null>(null);
   const sendMessageRef = useRef<(text: string) => void>(() => {});
+  const applyUiCommandRef = useRef<(cmd: any) => void>(() => {});
+  const holoCmdSeqRef = useRef<number>(1);
   const seenEventIdsRef = useRef<Set<string>>(new Set());
   const audioLevelRef = useRef<number>(0);
   const audioFreqRef = useRef<Uint8Array | null>(null);
@@ -453,6 +457,10 @@ export default function App() {
             if (!calibratingRef.current) setMood(String(data.mood).toUpperCase());
             return;
           }
+          if (data.type === "ui_command" && data.command) {
+            applyUiCommandRef.current(data.command);
+            return;
+          }
           if (data.type === "telemetry_frame") {
             setShip(data.ship);
             setFleet(data.fleet || []);
@@ -562,6 +570,52 @@ export default function App() {
       setBusy(false);
     }
   };
+
+  const applyUiCommand = (cmd: any) => {
+    if (!cmd || typeof cmd !== "object") return;
+    if (cmd.type === "hologram_command") {
+      const action = String(cmd.action || "open");
+      if (action === "close") {
+        setStageMode("core");
+        return;
+      }
+      setStageMode("hologram");
+      holoCmdSeqRef.current += 1;
+      setHoloCommand({
+        id: holoCmdSeqRef.current,
+        action: action as HologramCommand["action"],
+        target: cmd.target,
+        steps: cmd.steps,
+        view_mode: cmd.view_mode,
+      });
+      return;
+    }
+    if (cmd.type === "ui_nav") {
+      const act = String(cmd.action || "");
+      const tab = cmd.tab as "systems" | "rag" | "receipts" | "persona" | "config" | undefined;
+      if (tab && ["config", "persona", "systems", "rag", "receipts"].includes(tab)) {
+        setSettingsTab(tab);
+      }
+      if (act === "open_settings" || act === "switch_tab") {
+        setSettingsOpen(true);
+      } else if (act === "close_settings") {
+        setSettingsOpen(false);
+      } else if (act === "start_calibration") {
+        setSettingsOpen(false);
+        void runCalibration();
+      } else if (act === "open_personality_interview") {
+        setSettingsOpen(false);
+        setShowPersonaModal(true);
+      }
+      return;
+    }
+    if (cmd.type === "config_updated") {
+      void fetchConfigAndVoices();
+      setRefreshTick((t) => t + 1);
+    }
+  };
+
+  applyUiCommandRef.current = applyUiCommand;
 
   sendMessageRef.current = (txt: string) => {
     void sendMessage(txt);
@@ -803,6 +857,8 @@ export default function App() {
             fleet={fleet}
             selectedAlly={selectedAlly}
             onSelectAlly={setSelectedAlly}
+            shipName={config?.ship_name}
+            holoCommand={holoCommand}
           />
           <div
             className="orb-corner-pip"
@@ -910,6 +966,8 @@ export default function App() {
       {/* Hidden Settings & Diagnostics Modal (Systems, RAG, Receipts, Persona, Config) */}
       <SettingsModal
         visible={settingsOpen}
+        activeTab={settingsTab}
+        onTabChange={setSettingsTab}
         ship={ship}
         config={config}
         heartbeat={heartbeat}

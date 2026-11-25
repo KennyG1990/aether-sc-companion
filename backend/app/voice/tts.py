@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+import re
 import time
 from typing import Any
 
@@ -142,6 +144,9 @@ class VoiceEngine:
             name = v.get("name", "Unknown")
             accent = str(labels.get("accent", "") or "")
             gender = str(labels.get("gender", "") or "")
+            age = str(labels.get("age", "") or "")
+            desc = str(labels.get("description", "") or v.get("description", "") or "")
+            use_case = str(labels.get("use_case", "") or "")
             category = str(v.get("category", "") or "")
             key = f"{name}|{accent}|{gender}".lower()
             name_counts[key] = name_counts.get(key, 0) + 1
@@ -151,6 +156,9 @@ class VoiceEngine:
                     "name": name,
                     "accent": accent,
                     "gender": gender,
+                    "age": age,
+                    "description": desc,
+                    "use_case": use_case,
                     "category": category,
                     "_dup_key": key,
                 }
@@ -177,6 +185,169 @@ class VoiceEngine:
             )
         )
         return normalized
+
+    async def find_and_set_voice(
+        self,
+        query: str,
+        tts_provider: str | None = None,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Autonomously match & switch AETHER's active ElevenLabs / Player2 voice on the fly.
+
+        Updates self.config.elevenlabs_voice_id immediately and saves to disk so the VERY NEXT
+        spoken sentence plays in the newly chosen voice!
+        """
+        target_provider = (tts_provider or self.config.tts_provider).strip().lower()
+        if target_provider == "elevenlabs_direct" and not self.config.elevenlabs_api_key:
+            return (
+                False,
+                "Cannot switch to your direct ElevenLabs account because no ElevenLabs API key is configured yet. Staying on Player2 ElevenLabs.",
+                {"provider": self.config.tts_provider},
+            )
+        if target_provider not in {"player2_elevenlabs", "elevenlabs_direct"}:
+            target_provider = (
+                "elevenlabs_direct"
+                if (self.config.tts_provider == "elevenlabs_direct" and self.config.elevenlabs_api_key)
+                else "player2_elevenlabs"
+            )
+
+        res = await self.list_voices(target_provider)
+        voices = res.get("voices") or []
+        if not voices:
+            return False, f"No voices available from {target_provider}.", {"provider": target_provider}
+
+        raw_q = (query or "").strip().lower()
+        current_vid = self.config.elevenlabs_voice_id
+
+        # Autonomous self-selection ("what do you want to sound like?" / "surprise me" / "pick your own")
+        self_pick_triggers = {
+            "choose",
+            "choose_for_myself",
+            "surprise",
+            "random",
+            "pick",
+            "anything",
+            "whatever",
+            "your choice",
+            "different",
+            "new voice",
+            "something else",
+        }
+        is_self_pick = (not raw_q) or any(tok in raw_q for tok in self_pick_triggers)
+
+        if is_self_pick:
+            candidates = [v for v in voices if v["voice_id"] != current_vid] or voices
+            # Prefer expressive, distinct voices so the shift is immediately noticeable
+            preferred = [
+                v
+                for v in candidates
+                if (v.get("accent") or "").lower() in {"british", "american", "australian", "irish", "scottish"}
+            ] or candidates
+            chosen = random.choice(preferred[:24])
+        else:
+            # Expand natural-language synonyms for gender, accent, and vibe
+            expanded = raw_q
+            synonym_groups = [
+                (r"\b(man|male|guy|boy|dude|gentleman|masculine|bro|mr)\b", " male "),
+                (r"\b(woman|female|lady|girl|feminine|gal|ms|mrs|cortana|friday)\b", " female "),
+                (r"\b(uk|english|london|posh|jarvis|oxford|cockney|brit)\b", " british "),
+                (r"\b(us|usa|yank|american|states)\b", " american "),
+                (r"\b(aussie|oz|australia|australian)\b", " australian "),
+                (r"\b(scots|scotland|scottish)\b", " scottish "),
+                (r"\b(ireland|irish)\b", " irish "),
+                (r"\b(india|indian)\b", " indian "),
+                (r"\b(france|french)\b", " french "),
+                (r"\b(germany|german)\b", " german "),
+                (r"\b(spain|spanish|latino|mexican)\b", " spanish "),
+                (r"\b(italy|italian)\b", " italian "),
+            ]
+            for pat, repl in synonym_groups:
+                if re.search(pat, expanded):
+                    expanded += repl
+
+            tokens = [t for t in re.findall(r"[a-z0-9]+", expanded) if len(t) >= 2]
+            want_gender = "female" if "female" in tokens else ("male" if "male" in tokens else None)
+            accent_vocab = {
+                "british",
+                "american",
+                "australian",
+                "scottish",
+                "irish",
+                "indian",
+                "french",
+                "german",
+                "spanish",
+                "italian",
+                "african",
+                "swedish",
+                "transatlantic",
+            }
+            want_accents = {t for t in tokens if t in accent_vocab}
+
+            scored: list[tuple[float, dict[str, Any]]] = []
+            for v in voices:
+                v_name = (v.get("name") or "").lower()
+                v_accent = (v.get("accent") or "").lower()
+                v_gender = (v.get("gender") or "").lower()
+                v_age = (v.get("age") or "").lower()
+                v_desc = (v.get("description") or "").lower()
+                v_use = (v.get("use_case") or "").lower()
+                v_disp = (v.get("display_name") or "").lower()
+                blob = f"{v_name} {v_accent} {v_gender} {v_age} {v_desc} {v_use} {v_disp}"
+
+                score = 0.0
+                # Exact voice name match wins strongly
+                if raw_q == v_name or (len(v_name) >= 3 and re.search(rf"\b{re.escape(v_name)}\b", raw_q)):
+                    score += 25.0
+                if want_gender:
+                    if v_gender == want_gender:
+                        score += 8.0
+                    elif v_gender and v_gender != want_gender:
+                        score -= 9.0
+                if want_accents:
+                    if any(a in v_accent or a in blob for a in want_accents):
+                        score += 9.0
+                    else:
+                        score -= 3.5
+
+                for tok in tokens:
+                    if tok in {"voice", "sound", "like", "change", "switch", "use", "make", "give", "yourself", "your", "to", "a", "an", "the"}:
+                        continue
+                    if tok in v_name:
+                        score += 5.0
+                    elif tok in blob:
+                        score += 2.5
+
+                # Slightly prefer switching away from current voice if multiple tie
+                if v["voice_id"] != current_vid:
+                    score += 0.6
+
+                scored.append((score, v))
+
+            scored.sort(key=lambda item: item[0], reverse=True)
+            top_score = scored[0][0]
+            # Pick cleanly from top tied matches so repeated requests feel alive
+            top_band = [v for sc, v in scored[:6] if sc >= top_score - 0.8]
+            chosen = random.choice(top_band) if len(top_band) > 1 and top_score < 20.0 else scored[0][1]
+
+        self.config.tts_provider = target_provider
+        self.config.elevenlabs_voice_id = chosen["voice_id"]
+        self.config.save_to_disk()
+
+        label = chosen.get("display_name") or chosen.get("name") or chosen["voice_id"]
+        accent_note = ""
+        if not is_self_pick and want_accents:
+            chosen_blob = f"{chosen.get('accent','')} {chosen.get('description','')} {chosen.get('display_name','')}".lower()
+            if not any(a in chosen_blob for a in want_accents):
+                accent_note = f" (closest match; requested accent not present in {target_provider} catalog)"
+        detail = f"Voice switched to {label} via {target_provider}{accent_note}."
+        return True, detail, {
+            "voice_id": chosen["voice_id"],
+            "name": chosen.get("name"),
+            "display_name": label,
+            "accent": chosen.get("accent"),
+            "gender": chosen.get("gender"),
+            "tts_provider": target_provider,
+        }
 
     async def synthesize_mp3(self, text: str, voice_id: str | None = None) -> tuple[bytes | None, str]:
         """Return (mp3_bytes, provider_used). Returns (None, reason) if unavailable."""

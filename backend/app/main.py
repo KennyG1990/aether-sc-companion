@@ -117,8 +117,8 @@ class AetherRuntime:
         )
         self.triggers = TriggerEngine(cooldown_seconds=18.0)
         self.spotify = SpotifyConnector(self.config)
-        self.llm = LLMRouter(self.config, self.store, self.executor, spotify=self.spotify)
         self.voice = VoiceEngine(self.config)
+        self.llm = LLMRouter(self.config, self.store, self.executor, spotify=self.spotify, voice=self.voice)
 
         self.recent_history: list[dict[str, str]] = []
         self._turns_since_distill: int = 0
@@ -670,6 +670,9 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     if result.get("mood"):
         runtime.current_mood = str(result["mood"]).upper()
         await runtime.broadcast({"type": "mood_update", "mood": runtime.current_mood})
+
+    for cmd in result.get("ui_commands") or []:
+        await runtime.broadcast({"type": "ui_command", "command": cmd})
 
     # Full-history Conversation RAG (aic_history.lua): archive trimmed turns instead of deleting!
     if len(runtime.recent_history) > 8:

@@ -148,9 +148,12 @@ class PromptCompiler:
             f"=== F. EARLIER CONVERSATIONS (OLDEST FIRST — LATER EXCERPTS SUPERSEDE EARLIER ONES) ===\n"
             f"<earlier_conversations>\n{history_block}\n</earlier_conversations>\n\n"
             f"=== G. AVAILABLE DECISION FAMILIES & TOOLS ===\n"
-            "FAMILIES: converse, remember, ship_actions, fleet_tactics, spotify_media.\n"
+            "FAMILIES: converse, remember, ship_actions, fleet_tactics, spotify_media, voice_control, hologram_director, settings_control.\n"
             + "\n".join(action_lines)
             + "\n- spotify_control (SAFE): Launch Spotify and play any song, artist, album, or playlist, or pause/resume/skip/volume/now_playing."
+            + "\n- change_voice (SAFE): Change your ElevenLabs/Player2 voice on the fly whenever asked (e.g., 'British man', 'calm female', voice name, or 'choose_for_myself' when asked what you want to sound like — your reply IMMEDIATELY speaks in the new voice!)."
+            + "\n- control_hologram (SAFE): Open/close the Star Citizen 3D Holo-Map, zoom in/out progressively ('zoom out', 'zoom out more'), show & zoom onto our own live ship grid ('where are we?' / 'show me on the map'), snap/fly directly to a connected friend/ally ('bring up my friend' / 'where is Kestrel?'), focus any Stanton planet/moon (Crusader, Hurston, ArcCorp, MicroTech, Yela, Daymar, Cellin, etc.), or toggle Own Ship wireframe."
+            + "\n- control_settings (SAFEGUARDED): Open/close the Settings modal, navigate tabs (config, persona, systems, rag, receipts), and update any SAFE setting (persona name/tone/humor/verbosity/rules, pilot callsign, ship name, wake word, proactive alerts, mute/TTS, LLM model, telemetry mode). NEVER modify protected API keys, Player2 endpoints/Mod ID, OAuth secrets, or StarCitizen.exe path — the safeguard gate will refuse them so you cannot break yourself."
         )
 
         return CompiledPrompt(

@@ -12,6 +12,8 @@ import {
 
 interface SettingsModalProps {
   visible: boolean;
+  activeTab: "systems" | "rag" | "receipts" | "persona" | "config";
+  onTabChange: (tab: "systems" | "rag" | "receipts" | "persona" | "config") => void;
   ship: ShipTelemetry;
   config: AetherConfigData | null;
   heartbeat: HeartbeatState | null;
@@ -41,6 +43,8 @@ interface SettingsModalProps {
  */
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   visible,
+  activeTab,
+  onTabChange,
   ship,
   config,
   heartbeat,
@@ -103,6 +107,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <InspectorPanel
+            activeTab={activeTab}
+            onTabChange={onTabChange}
             ship={ship}
             config={config}
             heartbeat={heartbeat}
