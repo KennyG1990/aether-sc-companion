@@ -185,6 +185,22 @@ export interface SpotifyStatus {
   platform: string;
 }
 
+export interface GameLinkStatus {
+  state: "red" | "yellow" | "green";
+  status: string;
+  exe_configured: boolean;
+  exe_path: string;
+  exe_running: boolean;
+  exe_pid: number | null;
+  grpc_env_enabled: boolean;
+  api_connected: boolean;
+  grpc_target: string;
+  proto_loaded?: boolean;
+  label: string;
+  detail: string;
+  override?: string | null;
+}
+
 export interface AetherConfigData {
   llm_provider: string;
   player2_base_url: string;
@@ -202,12 +218,15 @@ export interface AetherConfigData {
   spotify_status?: SpotifyStatus;
   telemetry_mode: string;
   grpc_target: string;
+  star_citizen_exe_path?: string;
   proactive_alerts_enabled: boolean;
   tts_enabled: boolean;
   wake_word_enabled: boolean;
   pilot_callsign: string;
   ship_name: string;
   persona: PersonaProfile;
+  game_link?: GameLinkStatus;
+  mood?: string;
   grpc_status?: {
     target: string;
     port_open: boolean;

@@ -3,6 +3,7 @@ import { X, Power, Sparkles } from "lucide-react";
 import { InspectorPanel } from "./InspectorPanel";
 import {
   AetherConfigData,
+  GameLinkStatus,
   HeartbeatState,
   PersonaProfile,
   ShipTelemetry,
@@ -14,6 +15,8 @@ interface SettingsModalProps {
   ship: ShipTelemetry;
   config: AetherConfigData | null;
   heartbeat: HeartbeatState | null;
+  gameLink: GameLinkStatus;
+  currentMood: string;
   voices: VoiceOption[];
   voicesNote: string | null;
   refreshTick: number;
@@ -22,6 +25,8 @@ interface SettingsModalProps {
   onOpenPersonaInterview: () => void;
   onExecuteAction: (actionId: string) => void;
   onTriggerScenario: (scenario: string) => void;
+  onPreviewGameLink: (state: "auto" | "red" | "yellow" | "green") => Promise<void>;
+  onSetMood: (mood: string) => Promise<void>;
   onSaveConfig: (patch: Record<string, unknown>) => Promise<void>;
   onSavePersona: (profile: PersonaProfile) => Promise<void>;
   onPingHeartbeat: () => Promise<void>;
@@ -39,6 +44,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   ship,
   config,
   heartbeat,
+  gameLink,
+  currentMood,
   voices,
   voicesNote,
   refreshTick,
@@ -47,6 +54,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onOpenPersonaInterview,
   onExecuteAction,
   onTriggerScenario,
+  onPreviewGameLink,
+  onSetMood,
   onSaveConfig,
   onSavePersona,
   onPingHeartbeat,
@@ -97,10 +106,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             ship={ship}
             config={config}
             heartbeat={heartbeat}
+            gameLink={gameLink}
+            currentMood={currentMood}
             voices={voices}
             voicesNote={voicesNote}
             onExecuteAction={onExecuteAction}
             onTriggerScenario={onTriggerScenario}
+            onPreviewGameLink={onPreviewGameLink}
+            onSetMood={onSetMood}
             onSaveConfig={onSaveConfig}
             onSavePersona={onSavePersona}
             onOpenPersonaInterview={() => {

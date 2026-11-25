@@ -3,6 +3,7 @@ import { Sparkles, HeartPulse, Music } from "lucide-react";
 import {
   ActionReceipt,
   AetherConfigData,
+  GameLinkStatus,
   HeartbeatState,
   LLMModelOption,
   PersonaProfile,
@@ -15,10 +16,14 @@ interface InspectorPanelProps {
   ship: ShipTelemetry;
   config: AetherConfigData | null;
   heartbeat: HeartbeatState | null;
+  gameLink: GameLinkStatus;
+  currentMood: string;
   voices: VoiceOption[];
   voicesNote: string | null;
   onExecuteAction: (actionId: string) => void;
   onTriggerScenario: (scenario: string) => void;
+  onPreviewGameLink: (state: "auto" | "red" | "yellow" | "green") => Promise<void>;
+  onSetMood: (mood: string) => Promise<void>;
   onSaveConfig: (patch: Record<string, unknown>) => Promise<void>;
   onSavePersona: (profile: PersonaProfile) => Promise<void>;
   onOpenPersonaInterview: () => void;
@@ -32,10 +37,14 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   ship,
   config,
   heartbeat,
+  gameLink,
+  currentMood,
   voices,
   voicesNote,
   onExecuteAction,
   onTriggerScenario,
+  onPreviewGameLink,
+  onSetMood,
   onSaveConfig,
   onSavePersona,
   onOpenPersonaInterview,
@@ -65,6 +74,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   const [elevenModelId, setElevenModelId] = useState("eleven_multilingual_v2");
   const [elevenKey, setElevenKey] = useState("");
   const [telemetryMode, setTelemetryMode] = useState("simulator");
+  const [scExePath, setScExePath] = useState("");
   const [wakeWordEnabled, setWakeWordEnabled] = useState(true);
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyTestSong, setSpotifyTestSong] = useState("Shoot to Thrill AC/DC");
@@ -85,6 +95,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
       setVoiceId(config.elevenlabs_voice_id);
       setElevenModelId(config.elevenlabs_model_id || "eleven_multilingual_v2");
       setTelemetryMode(config.telemetry_mode);
+      setScExePath(config.star_citizen_exe_path || config.game_link?.exe_path || "");
       setWakeWordEnabled(config.wake_word_enabled);
       setSpotifyClientId(config.spotify_client_id || "");
       setPersonaDraft(config.persona);
@@ -157,6 +168,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
       elevenlabs_model_id: elevenModelId,
       spotify_client_id: spotifyClientId.trim(),
       telemetry_mode: telemetryMode,
+      star_citizen_exe_path: scExePath.trim(),
       wake_word_enabled: wakeWordEnabled,
     };
     if (openRouterKey.trim()) patch.openrouter_api_key = openRouterKey.trim();
@@ -311,6 +323,51 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                 <button className="btn active" onClick={() => onTriggerScenario("all_clear")}>
                   ALL CLEAR
                 </button>
+              </div>
+            </div>
+
+            <div className="card">
+              <div className="card-title">Game Link Beacon &amp; Orb Mood Preview</div>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+                Top-left beacon tracks <code>StarCitizen.exe</code> &amp; game gRPC API (not LLM). Preview slow
+                transitions or return to live detection:
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+                {(["auto", "red", "yellow", "green"] as const).map((st) => {
+                  const isActive =
+                    (st === "auto" && !gameLink.override) || (st !== "auto" && gameLink.override === st);
+                  return (
+                    <button
+                      key={st}
+                      className={`btn ${isActive ? "active" : ""}`}
+                      onClick={() => onPreviewGameLink(st)}
+                    >
+                      {st === "auto" ? "LIVE .EXE AUTO" : st.toUpperCase()}
+                    </button>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10.5, color: "var(--teal-dim)", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.1em" }}>
+                Orb Mood Color (Active: {currentMood})
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {[
+                  { id: "CALM", label: "Calm (Teal)" },
+                  { id: "HAPPY", label: "Happy (Emerald)" },
+                  { id: "PLAYFUL", label: "Playful (Violet)" },
+                  { id: "CURIOUS", label: "Curious (Sapphire)" },
+                  { id: "FOCUSED", label: "Focused (Amber)" },
+                  { id: "ALERT", label: "Alert (Crimson)" },
+                  { id: "SOLEMN", label: "Solemn (Indigo)" },
+                ].map((m) => (
+                  <button
+                    key={m.id}
+                    className={`btn ${currentMood.toUpperCase() === m.id ? "active" : ""}`}
+                    onClick={() => onSetMood(m.id)}
+                  >
+                    {m.label}
+                  </button>
+                ))}
               </div>
             </div>
           </>
@@ -639,7 +696,42 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
             </div>
 
             <div className="card">
-              <div className="card-title">3. Wake-Word Gate &amp; Star Citizen Link</div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <div className="card-title" style={{ marginBottom: 0 }}>
+                  3. StarCitizen.exe &amp; Game Telemetry API Link
+                </div>
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color:
+                      gameLink.state === "green"
+                        ? "#5eead4"
+                        : gameLink.state === "yellow"
+                          ? "#fbbf24"
+                          : "#f87171",
+                  }}
+                >
+                  {gameLink.label.toUpperCase()}
+                </span>
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.45, marginBottom: 10 }}>
+                {gameLink.detail}
+                <div style={{ marginTop: 4, fontSize: 10.5, color: "var(--teal-dim)" }}>
+                  Process: {gameLink.exe_running ? `RUNNING (PID ${gameLink.exe_pid})` : "NOT RUNNING"} ·{" "}
+                  <code>GRPC_CLIENT_SERVER_ENABLED</code>: {gameLink.grpc_env_enabled ? "ON" : "NOT SET"} ·{" "}
+                  gRPC <code>{gameLink.grpc_target}</code>: {gameLink.api_connected ? "LIVE" : "CLOSED"}
+                </div>
+              </div>
+              <div className="field-group">
+                <label>StarCitizen.exe Path (Auto-detected if blank)</label>
+                <input
+                  className="text-input"
+                  placeholder="C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Bin64\StarCitizen.exe"
+                  value={scExePath}
+                  onChange={(e) => setScExePath(e.target.value)}
+                />
+              </div>
               <div className="field-group">
                 <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
                   <input

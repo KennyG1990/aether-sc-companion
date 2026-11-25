@@ -27,6 +27,7 @@ import {
   AllyShipState,
   CalibrationResult,
   CalibrationStep,
+  GameLinkStatus,
   HeartbeatState,
   PendingConfirmation,
   PersonaProfile,
@@ -34,6 +35,20 @@ import {
   TelemetryEvent,
   VoiceOption,
 } from "./types";
+
+const DEFAULT_GAME_LINK: GameLinkStatus = {
+  state: "red",
+  status: "NOT_CONFIGURED",
+  exe_configured: false,
+  exe_path: "",
+  exe_running: false,
+  exe_pid: null,
+  grpc_env_enabled: false,
+  api_connected: false,
+  grpc_target: "127.0.0.1:2942",
+  label: "StarCitizen.exe offline",
+  detail: "Scanning for StarCitizen.exe and local gRPC API on 127.0.0.1:2942...",
+};
 
 const DEFAULT_SHIP: ShipTelemetry = {
   timestamp: Date.now() / 1000,
@@ -93,11 +108,12 @@ export default function App() {
   const [pendingConfirmations, setPendingConfirmations] = useState<PendingConfirmation[]>([]);
   const [config, setConfig] = useState<AetherConfigData | null>(null);
   const [heartbeat, setHeartbeat] = useState<HeartbeatState | null>(null);
+  const [gameLink, setGameLink] = useState<GameLinkStatus>(DEFAULT_GAME_LINK);
   const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [voicesNote, setVoicesNote] = useState<string | null>(null);
-  const [wsConnected, setWsConnected] = useState(false);
+  const [, setWsConnected] = useState(false);
 
-  const [mood, setMood] = useState("NOMINAL");
+  const [mood, setMood] = useState("CALM");
   const [speaking, setSpeaking] = useState(false);
   const [listening, setListening] = useState(false);
   const [handsFreeListening, setHandsFreeListening] = useState(false);
@@ -329,6 +345,8 @@ export default function App() {
         setConfig(data);
         setTtsEnabled(data.tts_enabled);
         if (data.player2_status?.heartbeat) setHeartbeat(data.player2_status.heartbeat);
+        if (data.game_link) setGameLink(data.game_link);
+        if (data.mood) setMood(data.mood);
         await refreshVoices(data.tts_provider);
       }
     } catch {
@@ -427,18 +445,31 @@ export default function App() {
             setHeartbeat(data.heartbeat);
             return;
           }
+          if (data.type === "game_link_update" && data.game_link) {
+            setGameLink(data.game_link);
+            return;
+          }
+          if (data.type === "mood_update" && data.mood) {
+            if (!calibratingRef.current) setMood(String(data.mood).toUpperCase());
+            return;
+          }
           if (data.type === "telemetry_frame") {
             setShip(data.ship);
             setFleet(data.fleet || []);
             setPendingConfirmations(data.pending_confirmations || []);
             if (data.heartbeat) setHeartbeat(data.heartbeat);
+            if (data.game_link) setGameLink(data.game_link);
 
             if (!calibratingRef.current) {
               const level = data.ship?.alert_level;
-              if (level === "COMBAT") setMood("COMBAT");
-              else if (level === "CAUTION") setMood("CAUTION");
+              if (level === "COMBAT") setMood("ALERT");
+              else if (level === "CAUTION") setMood("FOCUSED");
               else if (level === "NOMINAL") {
-                setMood((prev) => (prev === "COMBAT" || prev === "CAUTION" ? "NOMINAL" : prev));
+                setMood((prev) =>
+                  prev === "COMBAT" || prev === "CAUTION" || prev === "ALERT" || prev === "FOCUSED"
+                    ? "CALM"
+                    : prev
+                );
               }
             }
 
@@ -618,6 +649,26 @@ export default function App() {
     if (res.ok) setHeartbeat(await res.json());
   };
 
+  const previewGameLink = async (state: "auto" | "red" | "yellow" | "green") => {
+    const res = await fetch("/api/game-link/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state }),
+    });
+    if (res.ok) {
+      setGameLink(await res.json());
+    }
+  };
+
+  const applyMood = async (nextMood: string) => {
+    setMood(nextMood);
+    await fetch("/api/mood", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mood: nextMood }),
+    });
+  };
+
   const submitWhisper = (e: React.FormEvent) => {
     e.preventDefault();
     if (!whisperInput.trim() || busy) return;
@@ -626,39 +677,33 @@ export default function App() {
   };
 
   const persona = config?.persona || DEFAULT_PERSONA;
-  const moodClass =
-    mood === "COMBAT"
-      ? "mood-combat"
-      : mood === "CAUTION"
-        ? "mood-caution"
-        : mood === "HUMOR"
-          ? "mood-humor"
-          : "";
-  const dotClass = !wsConnected
-    ? "offline"
-    : ship.alert_level === "COMBAT"
-      ? "combat"
-      : ship.alert_level === "CAUTION"
-        ? "caution"
-        : "";
+  const moodKey = (mood || "CALM").toLowerCase();
+  const moodClass = moodKey === "calm" || moodKey === "nominal" ? "" : `mood-${moodKey}`;
+  const gameDotClass = `game-${gameLink.state}`;
 
   const showMicFilament = handsFreeListening || listening || micStatus !== "IDLE";
 
   return (
     <div className={`stage-shell ${moodClass}`}>
-      {/* Whisper-subtle ambient top-left identity */}
-      <div className="ambient-brand">
-        <span className={`ambient-dot ${dotClass}`} />
+      {/* Whisper-subtle ambient top-left identity + animated StarCitizen.exe Game Link beacon */}
+      <div
+        className="ambient-brand"
+        onClick={() => setSettingsOpen(true)}
+        title={`${gameLink.label} — ${gameLink.detail} (Click to configure StarCitizen.exe)`}
+      >
+        <span className={`ambient-dot ${gameDotClass}`} />
         <div>
           <div className="ambient-name">{persona.ai_name}</div>
-          <div className="ambient-sub">
+          <div className={`ambient-sub ${gameDotClass}`}>
             {speaking
               ? "Speaking"
               : listening || wakeWindowActive
                 ? "Listening"
                 : calibrating
                   ? "Calibrating"
-                  : ship.zone}
+                  : gameLink.state === "green"
+                    ? ship.zone
+                    : gameLink.label}
           </div>
         </div>
       </div>
@@ -868,6 +913,8 @@ export default function App() {
         ship={ship}
         config={config}
         heartbeat={heartbeat}
+        gameLink={gameLink}
+        currentMood={mood}
         voices={voices}
         voicesNote={voicesNote}
         refreshTick={refreshTick}
@@ -876,6 +923,8 @@ export default function App() {
         onOpenPersonaInterview={() => setShowPersonaModal(true)}
         onExecuteAction={executeAction}
         onTriggerScenario={triggerScenario}
+        onPreviewGameLink={previewGameLink}
+        onSetMood={applyMood}
         onSaveConfig={saveConfig}
         onSavePersona={handleSavePersonaDirect}
         onPingHeartbeat={pingHeartbeat}

@@ -100,6 +100,10 @@ class AetherConfig(BaseModel):
         description="'simulator' (17Hz built-in) or 'grpc' (127.0.0.1:2942).",
     )
     grpc_target: str = Field(default=os.getenv("SC_GRPC_TARGET", "127.0.0.1:2942"))
+    star_citizen_exe_path: str = Field(
+        default=os.getenv("STAR_CITIZEN_EXE_PATH", ""),
+        description="Optional path to StarCitizen.exe (auto-detected if left blank).",
+    )
     db_path: str = Field(default=os.getenv("AETHER_DB_PATH", str(DATA_DIR / "aether_memory.db")))
     proactive_alerts_enabled: bool = True
     tts_enabled: bool = True

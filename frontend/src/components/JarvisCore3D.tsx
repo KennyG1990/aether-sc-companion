@@ -2,7 +2,7 @@ import React, { useEffect, useRef } from "react";
 import * as THREE from "three";
 
 interface JarvisCore3DProps {
-  mood: string; // NOMINAL | CAUTION | COMBAT | HUMOR | CALIBRATING
+  mood: string; // CALM | HAPPY | PLAYFUL | CURIOUS | FOCUSED | ALERT | SOLEMN | CALIBRATING (+ NOMINAL/HUMOR/CAUTION/COMBAT aliases)
   speaking: boolean;
   listening: boolean;
   audioLevelRef: React.MutableRefObject<number>;
@@ -10,12 +10,19 @@ interface JarvisCore3DProps {
   showReflection?: boolean;
 }
 
-const MOOD_PALETTES: Record<string, { primary: number; rim: number }> = {
-  NOMINAL: { primary: 0x14b8a6, rim: 0x5eead4 },
-  CAUTION: { primary: 0xd97706, rim: 0xfcd34d },
-  COMBAT: { primary: 0xdc2626, rim: 0xfca5a5 },
-  HUMOR: { primary: 0x9333ea, rim: 0xd8b4fe },
-  CALIBRATING: { primary: 0x0ea5e9, rim: 0x67e8f9 },
+const MOOD_PALETTES: Record<string, { primary: number; rim: number; pace: number }> = {
+  CALM: { primary: 0x14b8a6, rim: 0x5eead4, pace: 1.0 },
+  NOMINAL: { primary: 0x14b8a6, rim: 0x5eead4, pace: 1.0 },
+  HAPPY: { primary: 0x10b981, rim: 0x6ee7b7, pace: 1.25 },
+  PLAYFUL: { primary: 0x8b5cf6, rim: 0xd8b4fe, pace: 1.38 },
+  HUMOR: { primary: 0x8b5cf6, rim: 0xd8b4fe, pace: 1.38 },
+  CURIOUS: { primary: 0x2563eb, rim: 0x7dd3fc, pace: 1.15 },
+  FOCUSED: { primary: 0xd97706, rim: 0xfcd34d, pace: 1.08 },
+  CAUTION: { primary: 0xd97706, rim: 0xfcd34d, pace: 1.08 },
+  ALERT: { primary: 0xdc2626, rim: 0xfca5a5, pace: 1.55 },
+  COMBAT: { primary: 0xdc2626, rim: 0xfca5a5, pace: 1.55 },
+  SOLEMN: { primary: 0x4f46e5, rim: 0xa5b4fc, pace: 0.72 },
+  CALIBRATING: { primary: 0x0ea5e9, rim: 0x67e8f9, pace: 2.2 },
 };
 
 const NOISE_GLSL = /* glsl */ `
@@ -459,15 +466,16 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       const t = clock.getElapsedTime();
       const { mood: m, speaking: isSpeaking, listening: isListening } = stateRef.current;
 
-      const pal = MOOD_PALETTES[m] || MOOD_PALETTES.NOMINAL;
+      const pal = MOOD_PALETTES[m] || MOOD_PALETTES.CALM;
       targetPrimary.setHex(pal.primary);
       targetRim.setHex(pal.rim);
       if (m === "CALIBRATING") {
         const sweep = (Math.sin(t * 4.5) + 1) * 0.5;
         targetRim.lerp(new THREE.Color(0xfbbf24), sweep * 0.55);
       }
-      primaryColor.lerp(targetPrimary, 0.08);
-      rimColor.lerp(targetRim, 0.08);
+      // Smooth, unhurried emotional color glide (~2s organic shift across orb + reflection)
+      primaryColor.lerp(targetPrimary, 0.025);
+      rimColor.lerp(targetRim, 0.025);
 
       let rawAmp = audioLevelRef.current || 0;
       let rawBass = 0;
@@ -542,9 +550,10 @@ export const JarvisCore3D: React.FC<JarvisCore3DProps> = ({
       coreRimMat.color.copy(rimColor);
       ambMat.color.copy(rimColor);
 
-      const rotBoost = m === "CALIBRATING" ? 2.6 : isSpeaking ? 1.45 : 1.0;
+      const moodPace = (MOOD_PALETTES[m] || MOOD_PALETTES.CALM).pace;
+      const rotBoost = (m === "CALIBRATING" ? 2.4 : isSpeaking ? 1.45 : 1.0) * moodPace;
       // Gentle levitation float
-      root.position.y = Math.sin(t * 1.45) * 0.06;
+      root.position.y = Math.sin(t * 1.45 * Math.min(1.3, moodPace)) * 0.06;
       outerShell.rotation.y += 0.0028 * rotBoost;
       outerShell.rotation.x = Math.sin(t * 0.35) * 0.14;
       innerMemShell.rotation.y -= 0.0038 * rotBoost;

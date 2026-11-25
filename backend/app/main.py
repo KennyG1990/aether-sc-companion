@@ -74,6 +74,14 @@ class SpotifyActionRequest(BaseModel):
     dry_run: bool = False
 
 
+class GameLinkTestRequest(BaseModel):
+    state: str = "auto"  # auto | red | yellow | green
+
+
+class MoodSetRequest(BaseModel):
+    mood: str = "CALM"
+
+
 class ConfigUpdateRequest(BaseModel):
     llm_provider: str | None = None
     player2_base_url: str | None = None
@@ -89,6 +97,8 @@ class ConfigUpdateRequest(BaseModel):
     spotify_client_id: str | None = None
     spotify_redirect_uri: str | None = None
     telemetry_mode: str | None = None
+    grpc_target: str | None = None
+    star_citizen_exe_path: str | None = None
     proactive_alerts_enabled: bool | None = None
     tts_enabled: bool | None = None
     wake_word_enabled: bool | None = None
@@ -101,7 +111,10 @@ class AetherRuntime:
         self.compiler = PromptCompiler(self.store)
         self.executor = ActionExecutor(self.store)
         self.simulator = TelemetrySimulator()
-        self.grpc_bridge = StarCitizenGrpcBridge(self.config.grpc_target)
+        self.grpc_bridge = StarCitizenGrpcBridge(
+            self.config.grpc_target,
+            exe_path=self.config.star_citizen_exe_path,
+        )
         self.triggers = TriggerEngine(cooldown_seconds=18.0)
         self.spotify = SpotifyConnector(self.config)
         self.llm = LLMRouter(self.config, self.store, self.executor, spotify=self.spotify)
@@ -109,9 +122,11 @@ class AetherRuntime:
 
         self.recent_history: list[dict[str, str]] = []
         self._turns_since_distill: int = 0
+        self.current_mood: str = "CALM"
         self.ui_clients: set[WebSocket] = set()
         self._telemetry_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._game_link_task: asyncio.Task[None] | None = None
         self.last_calibration: dict[str, Any] | None = None
 
         self.executor.set_dispatch_handler(self._dispatch_game_action)
@@ -124,6 +139,7 @@ class AetherRuntime:
     async def start_background_tasks(self) -> None:
         self._telemetry_task = asyncio.create_task(self._telemetry_loop())
         self._heartbeat_task = asyncio.create_task(self._player2_heartbeat_loop())
+        self._game_link_task = asyncio.create_task(self._game_link_loop())
         # Kick off one quiet background embedding pass so seeded memories get dense Player2 vectors
         asyncio.create_task(self._background_embed_pass())
 
@@ -152,13 +168,23 @@ class AetherRuntime:
             pass
 
     async def stop_background_tasks(self) -> None:
-        for task in (self._telemetry_task, self._heartbeat_task):
+        for task in (self._telemetry_task, self._heartbeat_task, self._game_link_task):
             if task:
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+    async def _game_link_loop(self) -> None:
+        """Continuously watch for StarCitizen.exe & local gRPC API (127.0.0.1:2942) every 2.5s."""
+        while True:
+            try:
+                info = await asyncio.to_thread(self.grpc_bridge.refresh_game_link)
+                await self.broadcast({"type": "game_link_update", "game_link": info})
+            except Exception:
+                pass
+            await asyncio.sleep(2.5)
 
     async def _player2_heartbeat_loop(self) -> None:
         """Official Player2 API requirement: ping GET /v1/health with player2-game-key every 60 seconds."""
@@ -191,6 +217,8 @@ class AetherRuntime:
                 "events": [e.model_dump() for e in events],
                 "pending_confirmations": self.executor.list_pending(),
                 "heartbeat": self.voice.heartbeat_state,
+                "game_link": self.grpc_bridge.game_link_state,
+                "mood": self.current_mood,
                 "grpc_status": {
                     "mode": self.config.telemetry_mode,
                     "target": self.config.grpc_target,
@@ -504,8 +532,30 @@ async def get_config() -> dict[str, Any]:
     data.pop("spotify_refresh_token", None)
     data["spotify_status"] = runtime.spotify.status_dict()
     data["grpc_status"] = runtime.grpc_bridge.status_dict()
+    data["game_link"] = runtime.grpc_bridge.game_link_state
+    data["mood"] = runtime.current_mood
     data["player2_status"] = await runtime.voice.probe_player2()
     return data
+
+
+@app.get("/api/game-link")
+async def get_game_link() -> dict[str, Any]:
+    return await asyncio.to_thread(runtime.grpc_bridge.refresh_game_link)
+
+
+@app.post("/api/game-link/test")
+async def test_game_link(req: GameLinkTestRequest) -> dict[str, Any]:
+    state = None if req.state.lower() == "auto" else req.state.lower()
+    info = await asyncio.to_thread(runtime.grpc_bridge.set_test_override, state)
+    await runtime.broadcast({"type": "game_link_update", "game_link": info})
+    return info
+
+
+@app.post("/api/mood")
+async def set_mood(req: MoodSetRequest) -> dict[str, Any]:
+    runtime.current_mood = (req.mood or "CALM").strip().upper()
+    await runtime.broadcast({"type": "mood_update", "mood": runtime.current_mood})
+    return {"mood": runtime.current_mood}
 
 
 @app.get("/api/spotify/status")
@@ -565,7 +615,13 @@ async def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
     for key, val in updates.items():
         if hasattr(runtime.config, key):
             setattr(runtime.config, key, val)
+    if "grpc_target" in updates:
+        runtime.grpc_bridge.target = runtime.config.grpc_target
+    if "star_citizen_exe_path" in updates:
+        runtime.grpc_bridge.set_configured_exe(runtime.config.star_citizen_exe_path)
     runtime.config.save_to_disk()
+    info = await asyncio.to_thread(runtime.grpc_bridge.refresh_game_link)
+    await runtime.broadcast({"type": "game_link_update", "game_link": info})
     return await get_config()
 
 
@@ -611,6 +667,9 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     runtime.recent_history.append({"role": "user", "content": compiled.user_message})
     runtime.recent_history.append({"role": "assistant", "content": result["reply"]})
     runtime._turns_since_distill += 2
+    if result.get("mood"):
+        runtime.current_mood = str(result["mood"]).upper()
+        await runtime.broadcast({"type": "mood_update", "mood": runtime.current_mood})
 
     # Full-history Conversation RAG (aic_history.lua): archive trimmed turns instead of deleting!
     if len(runtime.recent_history) > 8:

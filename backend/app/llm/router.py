@@ -573,9 +573,14 @@ class LLMRouter:
                 else:
                     reply_text = (choice.get("content") or f"Standing by, {self.config.persona.pilot_name}.").strip()
 
-                mood = self._infer_mood(reply_text, telemetry_snapshot, receipts)
+                clean_reply, mood = self._extract_and_infer_mood(
+                    reply_text,
+                    compiled.user_message,
+                    telemetry_snapshot,
+                    receipts,
+                )
                 return {
-                    "reply": reply_text,
+                    "reply": clean_reply,
                     "provider_used": f"{provider_label} ({used_model})",
                     "mood": mood,
                     "receipts": receipts,
@@ -729,11 +734,90 @@ class LLMRouter:
         }
 
     @staticmethod
+    def _extract_and_infer_mood(
+        raw_reply: str,
+        user_message: str,
+        telemetry: dict[str, Any],
+        receipts: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        """Extract & silently strip [MOOD:...] from LLM output; fall back to rich semantic mood inference."""
+        alias_map = {
+            "CALM": "CALM",
+            "NOMINAL": "CALM",
+            "SERENE": "CALM",
+            "NEUTRAL": "CALM",
+            "HAPPY": "HAPPY",
+            "WARM": "HAPPY",
+            "FRIENDLY": "HAPPY",
+            "EXCITED": "HAPPY",
+            "PROUD": "HAPPY",
+            "JOYFUL": "HAPPY",
+            "PLAYFUL": "PLAYFUL",
+            "HUMOR": "PLAYFUL",
+            "AMUSED": "PLAYFUL",
+            "WITTY": "PLAYFUL",
+            "SARCASTIC": "PLAYFUL",
+            "CURIOUS": "CURIOUS",
+            "THINKING": "CURIOUS",
+            "ANALYTICAL": "CURIOUS",
+            "INTRIGUED": "CURIOUS",
+            "FOCUSED": "FOCUSED",
+            "CAUTION": "FOCUSED",
+            "CONCERNED": "FOCUSED",
+            "SERIOUS": "FOCUSED",
+            "WARNING": "FOCUSED",
+            "ALERT": "ALERT",
+            "COMBAT": "ALERT",
+            "INTENSE": "ALERT",
+            "URGENT": "ALERT",
+            "ANGRY": "ALERT",
+            "FIERCE": "ALERT",
+            "SOLEMN": "SOLEMN",
+            "MELANCHOLY": "SOLEMN",
+            "SAD": "SOLEMN",
+            "EMPATHETIC": "SOLEMN",
+            "REFLECTIVE": "SOLEMN",
+        }
+
+        extracted: str | None = None
+        tag_matches = list(re.finditer(r"\s*\[MOOD\s*:\s*([A-Za-z_]+)\]\s*\.?", raw_reply, re.IGNORECASE))
+        if tag_matches:
+            raw_tag = tag_matches[-1].group(1).upper()
+            extracted = alias_map.get(raw_tag)
+            cleaned = re.sub(r"\s*\[MOOD\s*:\s*[A-Za-z_]+\]\s*", " ", raw_reply, flags=re.IGNORECASE).strip()
+            cleaned = re.sub(r"\s+([.!?])", r"\1", cleaned)
+        else:
+            cleaned = raw_reply.strip()
+
+        # Safety Gate and live Combat alerts always take tactical priority
+        if any(r.get("status") == "PENDING_CONFIRMATION" for r in receipts):
+            return cleaned, "FOCUSED"
+        if telemetry.get("alert_level") == "COMBAT":
+            return cleaned, "ALERT"
+        if extracted:
+            return cleaned, extracted
+
+        return cleaned, LLMRouter._infer_mood(f"{user_message} {cleaned}", telemetry, receipts)
+
+    @staticmethod
     def _infer_mood(text: str, telemetry: dict[str, Any], receipts: list[dict[str, Any]]) -> str:
         if any(r.get("status") == "PENDING_CONFIRMATION" for r in receipts):
-            return "CAUTION"
+            return "FOCUSED"
         if telemetry.get("alert_level") == "COMBAT":
-            return "COMBAT"
-        if any(w in text.lower() for w in ["joke", "duct tape", "elevator", "champagne", "haha"]):
-            return "HUMOR"
-        return telemetry.get("alert_level", "NOMINAL")
+            return "ALERT"
+        low = text.lower()
+        if any(w in low for w in ["hostile", "ambush", "under fire", "red alert", "enemy", "shields critical", "evasive", "danger"]):
+            return "ALERT"
+        if any(w in low for w in ["joke", "duct tape", "elevator", "champagne", "haha", "funny", "laugh", "sarcas", "teas", "banter", "cheeky"]):
+            return "PLAYFUL"
+        if any(w in low for w in ["sorry", "condolence", "rough day", "heavy", "solemn", "sad", "lost ", "regret", "tired", "tough"]):
+            return "SOLEMN"
+        if any(w in low for w in ["warning", "caution", "careful", "low fuel", "critical", "check your", "heads up"]):
+            return "FOCUSED"
+        if any(w in low for w in ["thank", "awesome", "great", "love ", "glad", "cheers", "happy", "proud", "nice", "spotify", "playing", "music", "vibe"]):
+            return "HAPPY"
+        if any(w in low for w in ["why ", "how ", "wonder", "interesting", "curious", "analyze", "investigat", "theory", "scan", "let's figure"]):
+            return "CURIOUS"
+        if telemetry.get("alert_level") == "CAUTION":
+            return "FOCUSED"
+        return "CALM"
