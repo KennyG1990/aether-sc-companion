@@ -1,8 +1,11 @@
 /**
- * Strict Wake-Word Gate for AETHER with Whisper phonetic resilience.
+ * Natural Wake-Word Gate for AETHER with Whisper phonetic resilience.
  *
- * - Rejects non-addressed speech ("Hey John, pass the salt") locally with zero LLM/TTS calls.
- * - Handles common Whisper phonetic spellings (e.g. "Aether" transcribed as "ether"/"either"/"ather").
+ * - Rejects non-addressed chatter ("Hey John, pass the salt") locally with zero LLM/TTS calls.
+ * - Accepts natural conversational lead-ins ("No, Ether. ...", "Wait, Aether, ...", "Remember this, Aether!")
+ *   while preserving leading intent words ("No", "Wait", "Actually") so AETHER understands context.
+ * - Handles common Whisper phonetic spellings ("Aether" -> "ether", "ather", "eather", "ayther", "aither";
+ *   plus vocative "either" when paired with greeting or punctuation).
  * - Filters out common Whisper silence artifacts ("[BLANK_AUDIO]", "Thank you.", etc.).
  */
 
@@ -14,10 +17,49 @@ export interface WakeWordParseResult {
 }
 
 const PHONETIC_ALIASES: Record<string, string[]> = {
-  aether: ["aether", "ether", "either", "ather", "eather", "ayther", "aither"],
+  aether: ["aether", "ether", "ather", "eather", "ayther", "aither", "heather"],
   jarvis: ["jarvis", "jarvus", "jarves", "jarvish"],
   cortana: ["cortana", "kortana", "cortanna"],
 };
+
+// Ambiguous English words that Whisper occasionally outputs for "Aether" — only match in vocative positions
+const VOCATIVE_ONLY_ALIASES: Record<string, string[]> = {
+  aether: ["either", "eater"],
+};
+
+const LEAD_IN_WORDS = new Set([
+  "hey",
+  "hi",
+  "hello",
+  "yo",
+  "ok",
+  "okay",
+  "no",
+  "yes",
+  "yeah",
+  "yep",
+  "nah",
+  "wait",
+  "hold",
+  "on",
+  "listen",
+  "look",
+  "actually",
+  "well",
+  "so",
+  "please",
+  "thanks",
+  "thank",
+  "sorry",
+  "alright",
+  "right",
+  "come",
+  "uh",
+  "um",
+  "oh",
+]);
+
+const GREETING_ONLY_WORDS = new Set(["hey", "hi", "hello", "yo", "ok", "okay", "uh", "um", "oh"]);
 
 const WHISPER_NOISE_PHRASES = new Set([
   "thank you",
@@ -44,7 +86,7 @@ function levenshtein(a: string, b: string): number {
   return dp[m][n];
 }
 
-function tokenMatchesAiName(token: string, aiName: string): boolean {
+function tokenMatchesAiName(token: string, aiName: string, isVocativeContext: boolean): boolean {
   const tok = token.toLowerCase().replace(/[^a-z0-9]/g, "");
   const target = aiName.toLowerCase().replace(/[^a-z0-9]/g, "");
   if (!tok || !target) return false;
@@ -52,6 +94,11 @@ function tokenMatchesAiName(token: string, aiName: string): boolean {
 
   const aliases = PHONETIC_ALIASES[target];
   if (aliases && aliases.includes(tok)) return true;
+
+  if (isVocativeContext) {
+    const vocAliases = VOCATIVE_ONLY_ALIASES[target];
+    if (vocAliases && vocAliases.includes(tok)) return true;
+  }
 
   // Allow edit-distance <= 1 for names of length >= 5 (prevents short false positives like "john")
   if (target.length >= 5 && Math.abs(tok.length - target.length) <= 1) {
@@ -85,47 +132,44 @@ export function parseWakeWord(
 
   const cleanName = (aiName || "Aether").trim();
   const words = raw.split(/\s+/);
-  const greetings = new Set(["hey", "hi", "hello", "yo", "ok", "okay"]);
 
-  let matchEndIdx = -1;
+  let nameIdx = -1;
+  for (let i = 0; i < words.length; i++) {
+    const prevClean = i > 0 ? words[i - 1].toLowerCase().replace(/[^a-z]/g, "") : "";
+    const hasTrailingPunct = /[,.:!?]$/.test(words[i]);
+    const prevHasComma = i > 0 && /[,.:!?]$/.test(words[i - 1]);
+    const isVocativeContext =
+      i === 0 ||
+      LEAD_IN_WORDS.has(prevClean) ||
+      prevHasComma ||
+      (hasTrailingPunct && i === words.length - 1);
 
-  // Case 1: "<AiName> ..."
-  if (words.length >= 1 && tokenMatchesAiName(words[0], cleanName)) {
-    matchEndIdx = 1;
-  }
-  // Case 2: "Hey <AiName> ..."
-  else if (
-    words.length >= 2 &&
-    greetings.has(words[0].toLowerCase().replace(/[^a-z]/g, "")) &&
-    tokenMatchesAiName(words[1], cleanName)
-  ) {
-    matchEndIdx = 2;
-  }
-  // Case 3: Mid-sentence "hey <AiName> ..."
-  else {
-    for (let i = 0; i < words.length - 1; i++) {
-      if (
-        greetings.has(words[i].toLowerCase().replace(/[^a-z]/g, "")) &&
-        tokenMatchesAiName(words[i + 1], cleanName)
-      ) {
-        matchEndIdx = i + 2;
-        break;
-      }
+    if (tokenMatchesAiName(words[i], cleanName, isVocativeContext)) {
+      nameIdx = i;
+      break;
     }
   }
 
-  if (matchEndIdx === -1) {
+  if (nameIdx === -1) {
     return { matched: false, kind: "ignored", command: "", raw };
   }
 
-  const remainder = words
-    .slice(matchEndIdx)
+  // Separate words before and after the AI's name
+  const beforeWords = words.slice(0, nameIdx);
+  const afterWords = words.slice(nameIdx + 1);
+
+  // Drop pure greetings ("Hey", "Okay") before the name, but KEEP meaningful lead-ins ("No", "Wait", "Actually")!
+  const meaningfulBefore = beforeWords.filter(
+    (w) => !GREETING_ONLY_WORDS.has(w.toLowerCase().replace(/[^a-z]/g, ""))
+  );
+
+  const combined = [...meaningfulBefore, ...afterWords]
     .join(" ")
     .replace(/^[,.:!?\s]+/, "")
     .trim();
 
-  if (!remainder) {
+  if (!combined) {
     return { matched: true, kind: "wake_only", command: "", raw };
   }
-  return { matched: true, kind: "command", command: remainder, raw };
+  return { matched: true, kind: "command", command: combined, raw };
 }

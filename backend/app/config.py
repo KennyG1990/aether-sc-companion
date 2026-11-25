@@ -85,7 +85,7 @@ class AetherConfig(BaseModel):
         default=os.getenv("ELEVENLABS_VOICE_ID", "01955d76-ed5b-754f-a070-a570ddfed516"),
     )
     elevenlabs_model_id: str = Field(
-        default=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
+        default=os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"),
     )
     elevenlabs_api_key: str = Field(default=os.getenv("ELEVENLABS_API_KEY", ""))
     spotify_client_id: str = Field(default=os.getenv("SPOTIFY_CLIENT_ID", ""))

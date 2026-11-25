@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .config import AetherConfig, PersonaProfile
@@ -625,54 +625,11 @@ async def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
     return await get_config()
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest) -> dict[str, Any]:
-    ship_dict = runtime.simulator.ship.model_dump()
-    fleet_list = [a.model_dump() for a in runtime.simulator.allies.values()]
-    actions = runtime.executor.list_triggerable_actions()
-
-    # Single query-time dense semantic embedding via Player2 /v1/embeddings (offline fallback automatic)
-    dense_q_vec: list[float] | None = None
-    dense_model_id: str | None = None
-    if runtime.config.llm_provider == "player2" or runtime.voice.heartbeat_state.get("last_ok"):
-        emb_res = await embed_via_player2(
-            [req.message],
-            runtime.config.player2_base_url,
-            runtime.config.player2_game_key,
-        )
-        if emb_res:
-            dense_q_vec = emb_res[0][0]
-            dense_model_id = emb_res[1]
-
-    compiled = runtime.compiler.compile(
-        user_utterance=req.message,
-        telemetry_snapshot=ship_dict,
-        fleet_snapshot=fleet_list,
-        available_actions=actions,
-        recent_history=runtime.recent_history,
-        pilot_callsign=runtime.config.pilot_callsign,
-        ship_name=runtime.config.ship_name,
-        persona=runtime.config.persona,
-        dense_query_vec=dense_q_vec,
-        dense_model_id=dense_model_id,
-    )
-
-    result = await runtime.llm.respond(
-        compiled=compiled,
-        recent_history=runtime.recent_history,
-        telemetry_snapshot=ship_dict,
-        fleet_snapshot=fleet_list,
-    )
-
+def _finalize_chat_turn(compiled: Any, result: dict[str, Any]) -> None:
+    """Commit conversation history, lossless 6-line archiving & off-path embedding/distillation."""
     runtime.recent_history.append({"role": "user", "content": compiled.user_message})
     runtime.recent_history.append({"role": "assistant", "content": result["reply"]})
     runtime._turns_since_distill += 2
-    if result.get("mood"):
-        runtime.current_mood = str(result["mood"]).upper()
-        await runtime.broadcast({"type": "mood_update", "mood": runtime.current_mood})
-
-    for cmd in result.get("ui_commands") or []:
-        await runtime.broadcast({"type": "ui_command", "command": cmd})
 
     # Full-history Conversation RAG (aic_history.lua): archive trimmed turns instead of deleting!
     if len(runtime.recent_history) > 8:
@@ -686,6 +643,41 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         asyncio.create_task(runtime._background_distill_episode(list(runtime.recent_history[-6:])))
     else:
         asyncio.create_task(runtime._background_embed_pass())
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest) -> dict[str, Any]:
+    ship_dict = runtime.simulator.ship.model_dump()
+    fleet_list = [a.model_dump() for a in runtime.simulator.allies.values()]
+    actions = runtime.executor.list_triggerable_actions()
+
+    # Non-blocking fast RAG on hot reply path (<2 ms local BM25 + 512d RRF); dense Player2 vectors backfill in background!
+    compiled = runtime.compiler.compile(
+        user_utterance=req.message,
+        telemetry_snapshot=ship_dict,
+        fleet_snapshot=fleet_list,
+        available_actions=actions,
+        recent_history=runtime.recent_history,
+        pilot_callsign=runtime.config.pilot_callsign,
+        ship_name=runtime.config.ship_name,
+        persona=runtime.config.persona,
+    )
+
+    result = await runtime.llm.respond(
+        compiled=compiled,
+        recent_history=runtime.recent_history,
+        telemetry_snapshot=ship_dict,
+        fleet_snapshot=fleet_list,
+    )
+
+    _finalize_chat_turn(compiled, result)
+    if result.get("mood"):
+        runtime.current_mood = str(result["mood"]).upper()
+        await runtime.broadcast({"type": "mood_update", "mood": runtime.current_mood})
+
+    for cmd in result.get("ui_commands") or []:
+        cmd_stamped = {**cmd, "cmd_id": f"cmd_{int(time.time() * 1000)}_{id(cmd) % 10000}"}
+        await runtime.broadcast({"type": "ui_command", "command": cmd_stamped})
 
     return {
         **result,
@@ -707,6 +699,84 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         "retrieved_history_count": len(compiled.retrieved_history),
         "pending_confirmations": runtime.executor.list_pending(),
     }
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest) -> StreamingResponse:
+    """Real-time SSE chat stream: instant token updates, first-sentence parallel ElevenLabs TTS,
+    single-turn tool execution, and immediate WebSocket UI command broadcast."""
+    ship_dict = runtime.simulator.ship.model_dump()
+    fleet_list = [a.model_dump() for a in runtime.simulator.allies.values()]
+    actions = runtime.executor.list_triggerable_actions()
+
+    compiled = runtime.compiler.compile(
+        user_utterance=req.message,
+        telemetry_snapshot=ship_dict,
+        fleet_snapshot=fleet_list,
+        available_actions=actions,
+        recent_history=runtime.recent_history,
+        pilot_callsign=runtime.config.pilot_callsign,
+        ship_name=runtime.config.ship_name,
+        persona=runtime.config.persona,
+    )
+
+    async def event_gen():
+        started = time.perf_counter()
+
+        async def _broadcast_ui(cmd: dict[str, Any]) -> None:
+            if "cmd_id" not in cmd:
+                cmd["cmd_id"] = f"cmd_{int(time.time() * 1000)}_{id(cmd) % 10000}"
+            await runtime.broadcast({"type": "ui_command", "command": cmd})
+
+        async for evt in runtime.llm.respond_stream(
+            compiled=compiled,
+            recent_history=runtime.recent_history,
+            telemetry_snapshot=ship_dict,
+            fleet_snapshot=fleet_list,
+            on_ui_command=_broadcast_ui,
+        ):
+            ev_name = evt["event"]
+            if ev_name == "done":
+                result = evt["result"]
+                _finalize_chat_turn(compiled, result)
+                if result.get("mood"):
+                    runtime.current_mood = str(result["mood"]).upper()
+                    await runtime.broadcast({"type": "mood_update", "mood": runtime.current_mood})
+                payload = {
+                    **result,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                    "injection_flagged": compiled.injection_flagged,
+                    "injection_reasons": compiled.injection_reasons,
+                    "retrieved_memories": [
+                        {
+                            "id": m.id,
+                            "domain": m.domain,
+                            "truth_class": m.truth_class,
+                            "provenance": m.provenance,
+                            "content": m.content,
+                            "bm25_rank": m.bm25_rank,
+                            "vector_score": m.vector_score,
+                            "rrf_score": m.rrf_score,
+                        }
+                        for m in compiled.retrieved_memories
+                    ],
+                    "retrieved_history_count": len(compiled.retrieved_history),
+                    "pending_confirmations": runtime.executor.list_pending(),
+                }
+                yield f"event: done\ndata: {json.dumps(payload)}\n\n"
+            elif ev_name == "ui_command":
+                cmd = evt["command"]
+                if "cmd_id" not in cmd:
+                    cmd["cmd_id"] = f"cmd_{int(time.time() * 1000)}_{id(cmd) % 10000}"
+                yield f"event: ui_command\ndata: {json.dumps(cmd)}\n\n"
+            else:
+                yield f"event: {ev_name}\ndata: {json.dumps(evt)}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/memories")

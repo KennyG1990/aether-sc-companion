@@ -5,6 +5,7 @@ Includes live per-provider model catalogs and Person-to-AI Personality Interview
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, Awaitable, Callable
 import json
 import random
 import re
@@ -37,6 +38,11 @@ CURATED_OPENROUTER_MODELS = [
     {"id": "meta-llama/llama-3.3-70b-instruct", "name": "Llama 3.3 70B", "detail": "Meta"},
 ]
 
+_SPOKEN_REPLY_PROP = {
+    "type": "string",
+    "description": "Concise, natural in-character spoken confirmation (1 short sentence) to say to the pilot right after this tool succeeds, enabling instant single-turn response.",
+}
+
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -49,7 +55,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "action_id": {
                         "type": "string",
                         "description": "Action ID from the available actions list (e.g., toggle_landing_gear, set_master_mode_nav, toggle_doors, self_destruct).",
-                    }
+                    },
+                    "spoken_reply": _SPOKEN_REPLY_PROP,
                 },
                 "required": ["action_id"],
             },
@@ -59,16 +66,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save a durable fact, crew note, preference, or running joke into AETHER's SQLite semantic memory.",
+            "description": "Save a durable fact, crew note, preference, rule, or running joke into AETHER's SQLite semantic memory.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "Fact or memory to remember."},
+                    "content": {"type": "string", "description": "Fact, rule, or memory to remember."},
                     "domain": {
                         "type": "string",
                         "enum": ["episodic", "fleet", "preference", "lore"],
                         "description": "Memory category.",
                     },
+                    "spoken_reply": _SPOKEN_REPLY_PROP,
                 },
                 "required": ["content"],
             },
@@ -100,6 +108,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": "Target volume percentage 0-100 (used with command='volume').",
                     },
+                    "spoken_reply": _SPOKEN_REPLY_PROP,
                 },
                 "required": ["command"],
             },
@@ -122,6 +131,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "enum": ["player2_elevenlabs", "elevenlabs_direct"],
                         "description": "Optional voice source override. Only pass if the user explicitly asks to switch between Player2 voices and their own ElevenLabs account.",
                     },
+                    "spoken_reply": _SPOKEN_REPLY_PROP,
                 },
                 "required": ["query"],
             },
@@ -163,6 +173,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "enum": ["fleet", "ship"],
                         "description": "For set_view_mode: 'fleet' (Stanton System & Friends Holo-Map) or 'ship' (Own-Ship 3D Wireframe).",
                     },
+                    "spoken_reply": _SPOKEN_REPLY_PROP,
                 },
                 "required": ["action"],
             },
@@ -197,6 +208,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "type": "object",
                         "description": "Safe key-value settings to update. Allowed keys: ai_name, pilot_name, tone, verbosity, question_style, humor_style, custom_rules, persona_summary, pilot_callsign, ship_name, wake_word_enabled, proactive_alerts_enabled, tts_enabled, tts_provider, elevenlabs_model_id, llm_provider, player2_model, openrouter_model, telemetry_mode.",
                     },
+                    "spoken_reply": _SPOKEN_REPLY_PROP,
                 },
             },
         },
@@ -259,6 +271,11 @@ class LLMRouter:
         self.executor = executor
         self.spotify = spotify
         self.voice = voice
+        # Persistent keep-alive HTTP pool avoids repeated TCP handshakes on Player2 / OpenRouter calls
+        self._http = httpx.AsyncClient(
+            timeout=35.0,
+            limits=httpx.Limits(max_keepalive_connections=12, max_connections=24),
+        )
 
     def _player2_chat_headers(self, resource: str) -> dict[str, str]:
         """Strict Player2 headers: player2-game-key + player2-resource + optional per-call player2-suggested-model."""
@@ -587,6 +604,385 @@ class LLMRouter:
             pass
         return None
 
+    async def respond_stream(
+        self,
+        compiled: CompiledPrompt,
+        recent_history: list[dict[str, str]],
+        telemetry_snapshot: dict[str, Any],
+        fleet_snapshot: list[dict[str, Any]],
+        on_ui_command: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Real-time SSE streaming response: streams tokens live, yields complete sentences for
+        parallel ElevenLabs TTS as soon as Sentence 1 finishes, and executes tool calls in a single turn!
+        """
+        provider = self.config.llm_provider.lower()
+        if provider == "player2":
+            base_url = f"{self.config.player2_base_url.rstrip('/')}/v1/chat/completions"
+            headers = self._player2_chat_headers("copilot-chat")
+            model = None
+            provider_label = "player2"
+        elif provider == "openrouter" and self.config.openrouter_api_key:
+            base_url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.config.openrouter_api_key}",
+                "HTTP-Referer": "https://github.com/KennyG1990/aether-sc-companion",
+                "X-Title": "AETHER Star Citizen AI Companion",
+            }
+            model = self.config.openrouter_model
+            provider_label = "openrouter"
+        else:
+            res = await self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
+            for cmd in res.get("ui_commands") or []:
+                if on_ui_command:
+                    await on_ui_command(cmd)
+                yield {"event": "ui_command", "command": cmd}
+            if res.get("reply"):
+                yield {"event": "token", "text": res["reply"]}
+                yield {"event": "sentence", "text": res["reply"]}
+            yield {"event": "done", "result": res}
+            return
+
+        messages: list[dict[str, Any]] = [{"role": "system", "content": compiled.system_prompt}]
+        for turn in recent_history[-6:]:
+            messages.append({"role": turn["role"], "content": turn["content"]})
+        messages.append({"role": "user", "content": compiled.user_message})
+
+        payload: dict[str, Any] = {
+            "messages": messages,
+            "tools": TOOL_DEFINITIONS,
+            "tool_choice": "auto",
+            "stream": True,
+            "temperature": 0.7,
+        }
+        if model:
+            payload["model"] = model
+
+        full_text = ""
+        sent_up_to = 0
+        used_model = model or provider_label
+        tool_call_acc: dict[int, dict[str, Any]] = {}
+
+        try:
+            async with self._http.stream("POST", base_url, headers=headers, json=payload, timeout=35.0) as resp:
+                if resp.status_code == 402:
+                    msg = f"Player2 Joules balance depleted, {self.config.persona.pilot_name}. Top up in Player2 App or switch to OpenRouter in Config."
+                    yield {"event": "token", "text": msg}
+                    yield {"event": "sentence", "text": msg}
+                    yield {
+                        "event": "done",
+                        "result": {
+                            "reply": msg,
+                            "provider_used": f"{provider_label} (402 low joules)",
+                            "mood": "FOCUSED",
+                            "receipts": [],
+                            "saved_memories": [],
+                            "ui_commands": [],
+                        },
+                    }
+                    return
+                resp.raise_for_status()
+
+                async for raw_line in resp.aiter_lines():
+                    line = raw_line.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if chunk.get("model"):
+                        used_model = chunk["model"]
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+
+                    # Accumulate streaming tool calls cleanly
+                    for tc_delta in delta.get("tool_calls") or []:
+                        idx = int(tc_delta.get("index", 0))
+                        slot = tool_call_acc.setdefault(
+                            idx,
+                            {"id": tc_delta.get("id") or f"call_{idx}", "type": "function", "function": {"name": "", "arguments": ""}},
+                        )
+                        if tc_delta.get("id"):
+                            slot["id"] = tc_delta["id"]
+                        fn_d = tc_delta.get("function") or {}
+                        if fn_d.get("name"):
+                            slot["function"]["name"] += fn_d["name"]
+                        if fn_d.get("arguments"):
+                            slot["function"]["arguments"] += fn_d["arguments"]
+
+                    # Stream visible text tokens live & flush completed sentences early to ElevenLabs TTS
+                    tok = delta.get("content")
+                    if tok:
+                        full_text += tok
+                        # Hide any trailing incomplete "[MOOD:..." bracket from live subtitle/TTS
+                        bracket_idx = full_text.rfind("[")
+                        hide_tail = bracket_idx != -1 and (
+                            "MOOD" in full_text[bracket_idx:].upper() or bracket_idx >= len(full_text) - 10
+                        )
+                        safe_visible = full_text[:bracket_idx] if hide_tail else full_text
+                        clean_vis = re.sub(r"\s*\[MOOD\s*:\s*[A-Za-z_]*\]?\s*", " ", safe_visible, flags=re.IGNORECASE).strip()
+                        if clean_vis:
+                            yield {"event": "token", "text": clean_vis}
+
+                        # Emit Sentence 1 (and subsequent sentences) to TTS the millisecond punctuation lands!
+                        if not tool_call_acc:
+                            unspoken = safe_visible[sent_up_to:]
+                            m_sent = re.search(r"^(.*?[.!?])(?:\s+|$)", unspoken, re.DOTALL)
+                            if m_sent and len(m_sent.group(1).strip()) >= 16:
+                                cand = re.sub(r"\s*\[MOOD\s*:\s*[A-Za-z_]*\]?\s*", " ", m_sent.group(1), flags=re.IGNORECASE).strip()
+                                if cand:
+                                    yield {"event": "sentence", "text": cand}
+                                sent_up_to += m_sent.end()
+
+            tool_calls = [tool_call_acc[k] for k in sorted(tool_call_acc.keys()) if tool_call_acc[k]["function"]["name"]]
+
+            if tool_calls:
+                reply_text, receipts, saved_memories, ui_commands = await self._execute_tool_batch(
+                    tool_calls=tool_calls,
+                    choice_content=full_text,
+                    messages=messages,
+                    base_url=base_url,
+                    headers=headers,
+                    model=model,
+                    provider_label=provider_label,
+                    telemetry_snapshot=telemetry_snapshot,
+                    fleet_snapshot=fleet_snapshot,
+                    on_ui_command=on_ui_command,
+                )
+                for cmd in ui_commands:
+                    yield {"event": "ui_command", "command": cmd}
+                clean_reply, mood = self._extract_and_infer_mood(
+                    reply_text, compiled.user_message, telemetry_snapshot, receipts
+                )
+                yield {"event": "token", "text": clean_reply}
+                if clean_reply:
+                    yield {"event": "sentence", "text": clean_reply}
+                yield {
+                    "event": "done",
+                    "result": {
+                        "reply": clean_reply,
+                        "provider_used": f"{provider_label} ({used_model})",
+                        "mood": mood,
+                        "receipts": receipts,
+                        "saved_memories": saved_memories,
+                        "ui_commands": ui_commands,
+                    },
+                }
+                return
+
+            # Pure conversational streamed turn: flush any remaining unspoken tail
+            reply_raw = full_text.strip() or f"Standing by, {self.config.persona.pilot_name}."
+            clean_reply, mood = self._extract_and_infer_mood(reply_raw, compiled.user_message, telemetry_snapshot, [])
+            tail = re.sub(r"\s*\[MOOD\s*:\s*[A-Za-z_]+\]\s*", " ", full_text[sent_up_to:], flags=re.IGNORECASE).strip()
+            if tail:
+                yield {"event": "sentence", "text": tail}
+            elif sent_up_to == 0 and clean_reply:
+                yield {"event": "sentence", "text": clean_reply}
+
+            yield {"event": "token", "text": clean_reply}
+            yield {
+                "event": "done",
+                "result": {
+                    "reply": clean_reply,
+                    "provider_used": f"{provider_label} ({used_model})",
+                    "mood": mood,
+                    "receipts": [],
+                    "saved_memories": [],
+                    "ui_commands": [],
+                },
+            }
+        except Exception as exc:
+            fallback = await self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
+            fallback["provider_used"] = f"demo_fallback ({provider_label} err: {exc.__class__.__name__})"
+            for cmd in fallback.get("ui_commands") or []:
+                if on_ui_command:
+                    await on_ui_command(cmd)
+                yield {"event": "ui_command", "command": cmd}
+            if fallback.get("reply"):
+                yield {"event": "token", "text": fallback["reply"]}
+                yield {"event": "sentence", "text": fallback["reply"]}
+            yield {"event": "done", "result": fallback}
+
+    async def _execute_tool_batch(
+        self,
+        tool_calls: list[dict[str, Any]],
+        choice_content: str,
+        messages: list[dict[str, Any]],
+        base_url: str,
+        headers: dict[str, str],
+        model: str | None,
+        provider_label: str,
+        telemetry_snapshot: dict[str, Any],
+        fleet_snapshot: list[dict[str, Any]],
+        on_ui_command: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Execute LLM tool calls and resolve spoken confirmation in ONE SINGLE TURN (eliminating
+        the slow 2nd LLM round-trip while preserving 100% Transition Authority truthfulness)."""
+        receipts: list[dict[str, Any]] = []
+        saved_memories: list[dict[str, Any]] = []
+        ui_commands: list[dict[str, Any]] = []
+        llm_spoken_candidates: list[str] = []
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": choice_content or "",
+                "tool_calls": tool_calls,
+            }
+        )
+
+        for idx, tc in enumerate(tool_calls):
+            fn_name = tc["function"]["name"]
+            raw_args = tc["function"].get("arguments") or "{}"
+            if isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    args = {}
+
+            spoken_hint = str(args.get("spoken_reply") or "").strip()
+            if spoken_hint:
+                llm_spoken_candidates.append(spoken_hint)
+
+            if fn_name == "trigger_game_action":
+                action_id = str(args.get("action_id", ""))
+                rcpt = self.executor.execute(action_id, source=f"{provider_label}_tool")
+                receipts.append(rcpt)
+                tool_out = json.dumps(rcpt)
+            elif fn_name == "save_memory":
+                mem = self.store.add_memory(
+                    content=str(args.get("content", "")),
+                    domain=str(args.get("domain", "episodic")),
+                    truth_class="user_claim",
+                    provenance="pilot_voice",
+                )
+                saved_memories.append(mem)
+                rcpt = self.store.record_receipt(
+                    action_id="memory:save",
+                    parameters={"domain": mem.get("domain", "episodic")},
+                    status="CONFIRMED",
+                    reason=f"Committed to memory: {mem['content'][:110]}",
+                    source=f"{provider_label}_tool",
+                )
+                receipts.append(rcpt)
+                tool_out = json.dumps({"saved": True, "id": mem["id"]})
+            elif fn_name == "spotify_control" and self.spotify is not None:
+                sp_cmd = str(args.get("command", "play"))
+                sp_query = str(args.get("query", ""))
+                sp_type = str(args.get("media_type", "track"))
+                sp_vol = args.get("volume_pct")
+                ok, detail, meta = await self.spotify.execute_command(
+                    command=sp_cmd,
+                    query=sp_query,
+                    media_type=sp_type,
+                    volume_pct=int(sp_vol) if sp_vol is not None else None,
+                )
+                rcpt = self.store.record_receipt(
+                    action_id=f"spotify:{sp_cmd}",
+                    parameters=meta,
+                    status="CONFIRMED" if ok else "FAILED",
+                    reason=detail,
+                    source=f"{provider_label}_tool",
+                )
+                receipts.append(rcpt)
+                tool_out = json.dumps(rcpt)
+            elif fn_name == "change_voice" and self.voice is not None:
+                rcpt, cmds = await self._execute_change_voice(args, provider_label)
+                receipts.append(rcpt)
+                ui_commands.extend(cmds)
+                for c in cmds:
+                    if on_ui_command:
+                        await on_ui_command(c)
+                tool_out = json.dumps(rcpt)
+            elif fn_name == "control_hologram":
+                rcpt, cmds = self._execute_control_hologram(
+                    args, telemetry_snapshot, fleet_snapshot, provider_label
+                )
+                receipts.append(rcpt)
+                ui_commands.extend(cmds)
+                for c in cmds:
+                    if on_ui_command:
+                        await on_ui_command(c)
+                tool_out = json.dumps(rcpt)
+            elif fn_name == "control_settings":
+                rcpt, cmds = self._execute_control_settings(args, provider_label)
+                receipts.append(rcpt)
+                ui_commands.extend(cmds)
+                for c in cmds:
+                    if on_ui_command:
+                        await on_ui_command(c)
+                tool_out = json.dumps(rcpt)
+            else:
+                tool_out = json.dumps({"error": f"Unknown tool {fn_name}"})
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or f"call_{idx}",
+                    "content": tool_out,
+                }
+            )
+
+        pilot = self.config.persona.pilot_name
+
+        # 1. Safety Gate or Safeguard blocks ALWAYS override spoken_reply deterministically (zero 2nd LLM wait!)
+        pending = [r for r in receipts if r.get("status") == "PENDING_CONFIRMATION"]
+        if pending:
+            acts = ", ".join(r["action_id"].replace("_", " ") for r in pending)
+            return (
+                f"Safety Gate engaged for {acts}, {pilot}. Confirm or abort before I execute that. [MOOD:FOCUSED]",
+                receipts,
+                saved_memories,
+                ui_commands,
+            )
+
+        blocked = [r for r in receipts if r.get("status") == "BLOCKED_SAFEGUARD"]
+        if blocked:
+            return (
+                f"I can't modify protected credentials or the game executable, {pilot} — those are locked by safeguard so I can't break myself. [MOOD:FOCUSED]",
+                receipts,
+                saved_memories,
+                ui_commands,
+            )
+
+        failed = [r for r in receipts if r.get("status") == "FAILED"]
+        if failed:
+            return (
+                f"{failed[0].get('reason', 'Action failed.')} [MOOD:FOCUSED]",
+                receipts,
+                saved_memories,
+                ui_commands,
+            )
+
+        # 2. All tools CONFIRMED -> instant single-turn confirmation! (Saves 4-7 seconds!)
+        # If the model gave us its own in-character spoken_reply (or choice text), speak it right away!
+        if llm_spoken_candidates:
+            # Make sure voice switches with an approximate accent stay truthful
+            voice_rcpt = next((r for r in receipts if r.get("action_id") == "voice:change"), None)
+            if voice_rcpt and "closest match" in (voice_rcpt.get("reason") or ""):
+                return f"{voice_rcpt['reason']} [MOOD:HAPPY]", receipts, saved_memories, ui_commands
+            return " ".join(llm_spoken_candidates), receipts, saved_memories, ui_commands
+
+        if choice_content and len(choice_content.strip()) >= 4:
+            return choice_content.strip(), receipts, saved_memories, ui_commands
+
+        # Crisp deterministic fallback directly from verified Transition Authority receipts
+        if receipts:
+            summary = " ".join(r.get("reason", "") for r in receipts if r.get("reason")).strip()
+            if summary:
+                return f"{summary} [MOOD:CALM]", receipts, saved_memories, ui_commands
+
+        return f"Done, {pilot}. [MOOD:CALM]", receipts, saved_memories, ui_commands
+
     async def _call_openai_compat(
         self,
         base_url: str,
@@ -613,143 +1009,53 @@ class LLMRouter:
         if model:
             payload["model"] = model
 
-        receipts: list[dict[str, Any]] = []
-        saved_memories: list[dict[str, Any]] = []
-        ui_commands: list[dict[str, Any]] = []
-
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(base_url, headers=headers, json=payload)
-                if resp.status_code == 402:
-                    return {
-                        "reply": f"Player2 Joules balance depleted, {self.config.persona.pilot_name}. Top up in the Player2 App (player2://ai-power) or switch to OpenRouter in Config.",
-                        "provider_used": f"{provider_label} (402 low joules)",
-                        "mood": "FOCUSED",
-                        "receipts": [],
-                        "saved_memories": [],
-                        "ui_commands": [],
-                    }
-                resp.raise_for_status()
-                data = resp.json()
-                used_model = data.get("model") or model or provider_label
-                choice = data["choices"][0]["message"]
-                tool_calls = choice.get("tool_calls") or []
-
-                if tool_calls:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": choice.get("content") or "",
-                            "tool_calls": tool_calls,
-                        }
-                    )
-                    for idx, tc in enumerate(tool_calls):
-                        fn_name = tc["function"]["name"]
-                        raw_args = tc["function"].get("arguments") or "{}"
-                        if isinstance(raw_args, dict):
-                            args = raw_args
-                        else:
-                            try:
-                                args = json.loads(raw_args)
-                            except json.JSONDecodeError:
-                                args = {}
-
-                        if fn_name == "trigger_game_action":
-                            action_id = str(args.get("action_id", ""))
-                            rcpt = self.executor.execute(action_id, source=f"{provider_label}_tool")
-                            receipts.append(rcpt)
-                            tool_out = json.dumps(rcpt)
-                        elif fn_name == "save_memory":
-                            mem = self.store.add_memory(
-                                content=str(args.get("content", "")),
-                                domain=str(args.get("domain", "episodic")),
-                                truth_class="user_claim",
-                                provenance="pilot_voice",
-                            )
-                            saved_memories.append(mem)
-                            tool_out = json.dumps({"saved": True, "id": mem["id"]})
-                        elif fn_name == "spotify_control" and self.spotify is not None:
-                            sp_cmd = str(args.get("command", "play"))
-                            sp_query = str(args.get("query", ""))
-                            sp_type = str(args.get("media_type", "track"))
-                            sp_vol = args.get("volume_pct")
-                            ok, detail, meta = await self.spotify.execute_command(
-                                command=sp_cmd,
-                                query=sp_query,
-                                media_type=sp_type,
-                                volume_pct=int(sp_vol) if sp_vol is not None else None,
-                            )
-                            rcpt = self.store.record_receipt(
-                                action_id=f"spotify:{sp_cmd}",
-                                parameters=meta,
-                                status="CONFIRMED" if ok else "FAILED",
-                                reason=detail,
-                                source=f"{provider_label}_tool",
-                            )
-                            receipts.append(rcpt)
-                            tool_out = json.dumps(rcpt)
-                        elif fn_name == "change_voice" and self.voice is not None:
-                            rcpt, cmds = await self._execute_change_voice(args, provider_label)
-                            receipts.append(rcpt)
-                            ui_commands.extend(cmds)
-                            tool_out = json.dumps(rcpt)
-                        elif fn_name == "control_hologram":
-                            rcpt, cmds = self._execute_control_hologram(
-                                args, telemetry_snapshot, fleet_snapshot, provider_label
-                            )
-                            receipts.append(rcpt)
-                            ui_commands.extend(cmds)
-                            tool_out = json.dumps(rcpt)
-                        elif fn_name == "control_settings":
-                            rcpt, cmds = self._execute_control_settings(args, provider_label)
-                            receipts.append(rcpt)
-                            ui_commands.extend(cmds)
-                            tool_out = json.dumps(rcpt)
-                        else:
-                            tool_out = json.dumps({"error": f"Unknown tool {fn_name}"})
-
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc.get("id") or f"call_{idx}",
-                                "content": tool_out,
-                            }
-                        )
-
-                    followup_payload: dict[str, Any] = {
-                        "messages": messages,
-                        "stream": False,
-                        "temperature": 0.7,
-                    }
-                    if model:
-                        followup_payload["model"] = model
-
-                    followup = await client.post(base_url, headers=headers, json=followup_payload)
-                    followup.raise_for_status()
-                    raw_followup = (followup.json()["choices"][0]["message"].get("content") or "").strip()
-                    if raw_followup:
-                        reply_text = raw_followup
-                    elif receipts:
-                        reply_text = receipts[-1].get("reason") or "Done."
-                    else:
-                        reply_text = f"Done, {self.config.persona.pilot_name}."
-                else:
-                    reply_text = (choice.get("content") or f"Standing by, {self.config.persona.pilot_name}.").strip()
-
-                clean_reply, mood = self._extract_and_infer_mood(
-                    reply_text,
-                    compiled.user_message,
-                    telemetry_snapshot,
-                    receipts,
-                )
+            resp = await self._http.post(base_url, headers=headers, json=payload, timeout=35.0)
+            if resp.status_code == 402:
                 return {
-                    "reply": clean_reply,
-                    "provider_used": f"{provider_label} ({used_model})",
-                    "mood": mood,
-                    "receipts": receipts,
-                    "saved_memories": saved_memories,
-                    "ui_commands": ui_commands,
+                    "reply": f"Player2 Joules balance depleted, {self.config.persona.pilot_name}. Top up in the Player2 App (player2://ai-power) or switch to OpenRouter in Config.",
+                    "provider_used": f"{provider_label} (402 low joules)",
+                    "mood": "FOCUSED",
+                    "receipts": [],
+                    "saved_memories": [],
+                    "ui_commands": [],
                 }
+            resp.raise_for_status()
+            data = resp.json()
+            used_model = data.get("model") or model or provider_label
+            choice = data["choices"][0]["message"]
+            tool_calls = choice.get("tool_calls") or []
+
+            if tool_calls:
+                reply_text, receipts, saved_memories, ui_commands = await self._execute_tool_batch(
+                    tool_calls=tool_calls,
+                    choice_content=choice.get("content") or "",
+                    messages=messages,
+                    base_url=base_url,
+                    headers=headers,
+                    model=model,
+                    provider_label=provider_label,
+                    telemetry_snapshot=telemetry_snapshot,
+                    fleet_snapshot=fleet_snapshot,
+                )
+            else:
+                receipts, saved_memories, ui_commands = [], [], []
+                reply_text = (choice.get("content") or f"Standing by, {self.config.persona.pilot_name}.").strip()
+
+            clean_reply, mood = self._extract_and_infer_mood(
+                reply_text,
+                compiled.user_message,
+                telemetry_snapshot,
+                receipts,
+            )
+            return {
+                "reply": clean_reply,
+                "provider_used": f"{provider_label} ({used_model})",
+                "mood": mood,
+                "receipts": receipts,
+                "saved_memories": saved_memories,
+                "ui_commands": ui_commands,
+            }
         except Exception as exc:
             fallback = await self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
             fallback["provider_used"] = f"demo_fallback ({provider_label} err: {exc.__class__.__name__})"

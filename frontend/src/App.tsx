@@ -140,10 +140,12 @@ export default function App() {
   const [showPersonaModal, setShowPersonaModal] = useState(false);
 
   const micControllerRef = useRef<AetherMicController | null>(null);
-  const sendMessageRef = useRef<(text: string) => void>(() => {});
+  const sendMessageRef = useRef<(text: string, bypassWake?: boolean) => void>(() => {});
   const applyUiCommandRef = useRef<(cmd: any) => void>(() => {});
   const holoCmdSeqRef = useRef<number>(1);
   const seenEventIdsRef = useRef<Set<string>>(new Set());
+  const seenUiCmdIdsRef = useRef<Set<string>>(new Set());
+  const isPushToTalkRef = useRef<boolean>(false);
   const audioLevelRef = useRef<number>(0);
   const audioFreqRef = useRef<Uint8Array | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -174,7 +176,7 @@ export default function App() {
       onStateChange: (st) => setMicStatus(st),
       onTranscript: (text) => {
         if (text.trim()) {
-          sendMessageRef.current(text.trim());
+          sendMessageRef.current(text.trim(), isPushToTalkRef.current);
         }
       },
       onError: (msg) => {
@@ -190,7 +192,7 @@ export default function App() {
     };
   }, []);
 
-  const openWakeWindow = (ms = 15000) => {
+  const openWakeWindow = (ms = 18000) => {
     wakeWindowRef.current = true;
     setWakeWindowActive(true);
     if (wakeTimerRef.current) clearTimeout(wakeTimerRef.current);
@@ -198,6 +200,15 @@ export default function App() {
       wakeWindowRef.current = false;
       setWakeWindowActive(false);
     }, ms);
+  };
+
+  const pauseWakeWindowTimer = () => {
+    if (wakeTimerRef.current) {
+      clearTimeout(wakeTimerRef.current);
+      wakeTimerRef.current = null;
+    }
+    wakeWindowRef.current = true;
+    setWakeWindowActive(true);
   };
 
   const browserSpeakFallback = (text: string): Promise<void> =>
@@ -304,6 +315,7 @@ export default function App() {
   const drainSpeechQueue = async () => {
     if (ttsPlayingRef.current) return;
     ttsPlayingRef.current = true;
+    if (wakeWindowRef.current) pauseWakeWindowTimer();
     try {
       while (ttsQueueRef.current.length > 0) {
         const nextText = ttsQueueRef.current.shift();
@@ -318,6 +330,10 @@ export default function App() {
       setSpeaking(false);
       audioLevelRef.current = 0;
       audioFreqRef.current = null;
+      // Start fresh 18s conversational follow-up window AFTER Aether finishes speaking!
+      if (wakeWindowRef.current) {
+        openWakeWindow(18000);
+      }
     }
   };
 
@@ -519,13 +535,13 @@ export default function App() {
     }
   }, [fleet]);
 
-  const sendMessage = async (rawText: string) => {
+  const sendMessage = async (rawText: string, bypassWakeWord = false) => {
     const activeCfg = configRef.current;
     const aiName = activeCfg?.persona?.ai_name || "Aether";
     const pilotName = activeCfg?.persona?.pilot_name || "Commander";
     const wakeEnabled = activeCfg?.wake_word_enabled ?? true;
 
-    const parsed = parseWakeWord(rawText, aiName, wakeEnabled, wakeWindowRef.current);
+    const parsed = parseWakeWord(rawText, aiName, wakeEnabled && !bypassWakeWord, wakeWindowRef.current);
     if (!parsed.matched) {
       setLastIgnoredSpeech(rawText);
       return;
@@ -534,7 +550,7 @@ export default function App() {
     setLastIgnoredSpeech(null);
 
     if (parsed.kind === "wake_only") {
-      openWakeWindow(15000);
+      openWakeWindow(18000);
       const reply = `${pilotName}?`;
       setSubtitle(reply);
       setSubtitleMeta(`LISTENING TO ${pilotName.toUpperCase()}`);
@@ -542,37 +558,97 @@ export default function App() {
       return;
     }
 
-    openWakeWindow(12000);
+    // Keep conversation window open while Aether thinks & speaks; start 18s countdown AFTER he finishes talking!
+    pauseWakeWindowTimer();
     setBusy(true);
     setSubtitleMeta(`HEARD: “${parsed.command}”`);
 
+    let spokeAnySentence = false;
+
     try {
-      const res = await fetch("/api/chat", {
+      const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: parsed.command }),
       });
-      const data = await res.json();
-      setMood(data.mood || ship.alert_level || "NOMINAL");
-      setPendingConfirmations(data.pending_confirmations || []);
-      setSubtitle(data.reply);
-      setSubtitleMeta(
-        data.receipts?.length
-          ? `${data.receipts.map((r: any) => `${r.action_id.replace(/_/g, " ")}: ${r.status}`).join(" · ")}`
-          : `${aiName.toUpperCase()} // ONLINE`
-      );
-      speak(data.reply);
-      setRefreshTick((t) => t + 1);
+
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let splitIdx: number;
+        while ((splitIdx = buf.indexOf("\n\n")) !== -1) {
+          const rawBlock = buf.slice(0, splitIdx).trim();
+          buf = buf.slice(splitIdx + 2);
+          if (!rawBlock) continue;
+
+          let evName = "message";
+          const dataLines: string[] = [];
+          for (const line of rawBlock.split("\n")) {
+            if (line.startsWith("event:")) evName = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+          }
+          if (!dataLines.length) continue;
+
+          try {
+            const payload = JSON.parse(dataLines.join("\n"));
+            if (evName === "token" && typeof payload.text === "string") {
+              setSubtitle(payload.text);
+            } else if (evName === "sentence" && typeof payload.text === "string" && payload.text.trim()) {
+              spokeAnySentence = true;
+              speak(payload.text);
+            } else if (evName === "ui_command") {
+              applyUiCommand(payload);
+            } else if (evName === "done") {
+              setMood(payload.mood || ship.alert_level || "CALM");
+              setPendingConfirmations(payload.pending_confirmations || []);
+              if (payload.reply) setSubtitle(payload.reply);
+              setSubtitleMeta(
+                payload.receipts?.length
+                  ? `${payload.receipts.map((r: any) => `${r.action_id.replace(/_/g, " ")}: ${r.status}`).join(" · ")}`
+                  : `${aiName.toUpperCase()} // ONLINE`
+              );
+              if (!spokeAnySentence && payload.reply) {
+                spokeAnySentence = true;
+                speak(payload.reply);
+              }
+              setRefreshTick((t) => t + 1);
+            }
+          } catch {
+            // ignore partial JSON
+          }
+        }
+      }
     } catch {
       setSubtitle("Backend link offline on port 8785.");
       setSubtitleMeta("DISCONNECTED");
     } finally {
       setBusy(false);
+      // If TTS is muted or nothing was spoken, start the 18s follow-up countdown right away
+      if (!ttsPlayingRef.current && ttsQueueRef.current.length === 0) {
+        openWakeWindow(18000);
+      }
     }
   };
 
   const applyUiCommand = (cmd: any) => {
     if (!cmd || typeof cmd !== "object") return;
+    if (cmd.cmd_id) {
+      if (seenUiCmdIdsRef.current.has(cmd.cmd_id)) return;
+      seenUiCmdIdsRef.current.add(cmd.cmd_id);
+      if (seenUiCmdIdsRef.current.size > 100) {
+        seenUiCmdIdsRef.current.clear();
+      }
+    }
     if (cmd.type === "hologram_command") {
       const action = String(cmd.action || "open");
       if (action === "close") {
@@ -617,20 +693,23 @@ export default function App() {
 
   applyUiCommandRef.current = applyUiCommand;
 
-  sendMessageRef.current = (txt: string) => {
-    void sendMessage(txt);
+  sendMessageRef.current = (txt: string, bypassWake = false) => {
+    void sendMessage(txt, bypassWake);
   };
 
   const toggleMic = async () => {
     const ctrl = micControllerRef.current;
     if (!ctrl) return;
     if (listening && !handsFreeListening) {
+      isPushToTalkRef.current = false;
       setListening(false);
       await ctrl.stop();
       return;
     }
     setHandsFreeListening(false);
+    isPushToTalkRef.current = true;
     const ok = await ctrl.startPushToTalk();
+    if (!ok) isPushToTalkRef.current = false;
     setListening(ok);
   };
 
@@ -643,6 +722,7 @@ export default function App() {
       await ctrl.stop();
       return;
     }
+    isPushToTalkRef.current = false;
     const ok = await ctrl.startHandsFreeWake();
     setHandsFreeListening(ok);
     setListening(ok);

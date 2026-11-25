@@ -17,6 +17,10 @@ class VoiceEngine:
 
     def __init__(self, config: AetherConfig) -> None:
         self.config = config
+        self._http = httpx.AsyncClient(
+            timeout=25.0,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        )
         self._cached_p2_voices: list[dict[str, Any]] = []
         self._cached_direct_voices: list[dict[str, Any]] = []
         self.heartbeat_state: dict[str, Any] = {
@@ -376,10 +380,9 @@ class VoiceEngine:
                 "voice_settings": {"stability": 0.52, "similarity_boost": 0.78, "style": 0.25},
             }
             try:
-                async with httpx.AsyncClient(timeout=25.0) as client:
-                    resp = await client.post(url, headers=headers, json=body)
-                    resp.raise_for_status()
-                    return resp.content, "elevenlabs_direct"
+                resp = await self._http.post(url, headers=headers, json=body, timeout=25.0)
+                resp.raise_for_status()
+                return resp.content, "elevenlabs_direct"
             except Exception as exc:
                 return None, f"elevenlabs_direct_error:{exc.__class__.__name__}"
 
@@ -396,12 +399,11 @@ class VoiceEngine:
             "voice_settings": {"stability": 0.55, "similarity_boost": 0.78, "speed": 1.04},
         }
         try:
-            async with httpx.AsyncClient(timeout=25.0) as client:
-                resp = await client.post(url, headers=headers, json=body)
-                resp.raise_for_status()
-                if resp.content:
-                    return resp.content, "player2_elevenlabs"
-                return None, "player2_elevenlabs_empty"
+            resp = await self._http.post(url, headers=headers, json=body, timeout=25.0)
+            resp.raise_for_status()
+            if resp.content:
+                return resp.content, "player2_elevenlabs"
+            return None, "player2_elevenlabs_empty"
         except Exception as exc:
             return None, f"player2_elevenlabs_error:{exc.__class__.__name__}"
 
