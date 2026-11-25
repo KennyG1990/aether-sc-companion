@@ -113,19 +113,51 @@ export interface ChatMessage {
 export interface VoiceOption {
   voice_id: string;
   name: string;
+  display_name?: string;
   accent: string;
   gender: string;
   category: string;
 }
 
+export interface LLMModelOption {
+  id: string;
+  name: string;
+  detail: string;
+}
+
+export interface HeartbeatState {
+  count: number;
+  last_ok: boolean;
+  last_at: number | null;
+  client_version: string | null;
+  mod_id: string;
+  interval_sec: number;
+  last_error: string | null;
+}
+
 export interface Player2Status {
   api_online: boolean;
+  base_url?: string;
+  mod_id?: string;
   client_version: string | null;
+  heartbeat?: HeartbeatState;
   joules: number | null;
   patron_tier: string | null;
   elevenlabs_voices_count: number;
   mcp_online: boolean;
   mcp_server: string | null;
+}
+
+export interface PersonaProfile {
+  ai_name: string;
+  pilot_name: string;
+  tone: string;
+  verbosity: string;
+  question_style: string;
+  humor_style: string;
+  custom_rules: string;
+  persona_summary: string;
+  calibrated: boolean;
 }
 
 export interface CalibrationStep {
@@ -150,6 +182,7 @@ export interface AetherConfigData {
   player2_base_url: string;
   player2_mcp_url: string;
   player2_game_key: string;
+  player2_model: string;
   openrouter_api_key_set: boolean;
   openrouter_model: string;
   tts_provider: string;
@@ -160,8 +193,10 @@ export interface AetherConfigData {
   grpc_target: string;
   proactive_alerts_enabled: boolean;
   tts_enabled: boolean;
+  wake_word_enabled: boolean;
   pilot_callsign: string;
   ship_name: string;
+  persona: PersonaProfile;
   grpc_status?: {
     target: string;
     port_open: boolean;

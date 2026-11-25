@@ -1,4 +1,7 @@
-"""Unified Decision Authority Router: Player2 Local API (4315) <-> OpenRouter <-> Offline Demo."""
+"""Unified Decision Authority Router: Strict Player2 API <-> OpenRouter <-> Offline Demo.
+
+Includes live per-provider model catalogs and Person-to-AI Personality Interview synthesis.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from ..config import AetherConfig
+from ..config import AetherConfig, PersonaProfile
 from ..rag.compiler import CompiledPrompt
 from ..rag.store import MemoryStore
 from ..telemetry.actions import ActionExecutor
@@ -19,6 +22,17 @@ JOKES = [
     "What's the deadliest boss fight in Stanton? A Grim HEX elevator right after you've loaded 400 SCU of refined Quantanium.",
     "A Vanduul Scythe, a pirate Cutlass, and an Origin 890 Jump walk into a hangar. Only the 890 Jump asks for champagne before exploding.",
     "Why do Star Citizen pilots love Master Modes? Because nothing says 'relaxing road trip' like turning off your shields at 1,100 meters per second.",
+]
+
+CURATED_OPENROUTER_MODELS = [
+    {"id": "anthropic/claude-3.7-sonnet", "name": "Claude 3.7 Sonnet", "detail": "Anthropic"},
+    {"id": "anthropic/claude-3.5-haiku", "name": "Claude 3.5 Haiku", "detail": "Fast / Low-Latency"},
+    {"id": "google/gemini-2.5-pro", "name": "Gemini 2.5 Pro", "detail": "Google"},
+    {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash", "detail": "Fast / Low-Latency"},
+    {"id": "openai/gpt-4o", "name": "GPT-4o", "detail": "OpenAI"},
+    {"id": "openai/gpt-4o-mini", "name": "GPT-4o Mini", "detail": "Fast / Budget"},
+    {"id": "deepseek/deepseek-chat-v3-0324", "name": "DeepSeek V3", "detail": "DeepSeek"},
+    {"id": "meta-llama/llama-3.3-70b-instruct", "name": "Llama 3.3 70B", "detail": "Meta"},
 ]
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -69,6 +83,74 @@ class LLMRouter:
         self.store = store
         self.executor = executor
 
+    def _player2_chat_headers(self, resource: str) -> dict[str, str]:
+        """Strict Player2 headers: player2-game-key + player2-resource + optional per-call player2-suggested-model."""
+        headers = {
+            "Content-Type": "application/json",
+            "player2-game-key": self.config.player2_game_key,
+            "player2-resource": resource,
+        }
+        if self.config.player2_model.strip():
+            headers["player2-suggested-model"] = self.config.player2_model.strip()
+        return headers
+
+    async def list_models(self, provider: str) -> list[dict[str, Any]]:
+        """List available models for either Player2 (/v1/catalog/models?kind=llm) or OpenRouter."""
+        prov = provider.lower()
+        if prov == "player2":
+            base = self.config.player2_base_url.rstrip("/")
+            models: list[dict[str, Any]] = [
+                {"id": "", "name": "Player2 App Default (Recommended)", "detail": "Uses your active Player2 App choice"}
+            ]
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(
+                        f"{base}/v1/catalog/models",
+                        params={"kind": "llm"},
+                        headers={"player2-game-key": self.config.player2_game_key},
+                    )
+                    if resp.status_code == 200:
+                        for m in resp.json().get("data", []):
+                            price = m.get("price") or {}
+                            detail = f"{price.get('joules', '?')} J/{price.get('per', '1k')}"
+                            if m.get("patron_only"):
+                                detail = f"Patron · {detail}"
+                            models.append(
+                                {
+                                    "id": m.get("id", ""),
+                                    "name": m.get("name", m.get("id", "")),
+                                    "detail": detail,
+                                }
+                            )
+            except Exception:
+                pass
+            return models
+
+        if prov == "openrouter":
+            # Start with curated favorites, then enrich from live OpenRouter catalog if reachable
+            models = list(CURATED_OPENROUTER_MODELS)
+            seen = {m["id"] for m in models}
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get("https://openrouter.ai/api/v1/models")
+                    if resp.status_code == 200:
+                        for m in resp.json().get("data", [])[:80]:
+                            mid = m.get("id")
+                            if mid and mid not in seen:
+                                seen.add(mid)
+                                models.append(
+                                    {
+                                        "id": mid,
+                                        "name": m.get("name", mid),
+                                        "detail": f"ctx {m.get('context_length', '?')}",
+                                    }
+                                )
+            except Exception:
+                pass
+            return models
+
+        return [{"id": "demo", "name": "Built-in Offline Demo Co-Pilot", "detail": "Zero API keys"}]
+
     async def respond(
         self,
         compiled: CompiledPrompt,
@@ -80,11 +162,8 @@ class LLMRouter:
         if provider == "player2":
             return await self._call_openai_compat(
                 base_url=f"{self.config.player2_base_url.rstrip('/')}/v1/chat/completions",
-                headers={
-                    "Content-Type": "application/json",
-                    "player2-game-key": self.config.player2_game_key,
-                },
-                model=None,  # Per Player2 /v1/openapi.json, Player2 routes using user's selected model
+                headers=self._player2_chat_headers("copilot-chat"),
+                model=None,
                 provider_label="player2",
                 compiled=compiled,
                 recent_history=recent_history,
@@ -112,26 +191,25 @@ class LLMRouter:
         return self._demo_respond(compiled, telemetry_snapshot, fleet_snapshot)
 
     async def generate_calibration_briefing(self, diagnostics: dict[str, Any]) -> tuple[str, str]:
-        """Use Player2/OpenRouter LLM to deliver a sharp Jarvis post-calibration ship readiness briefing."""
+        """Deliver a sharp post-calibration ship readiness briefing honoring the calibrated persona."""
+        p = self.config.persona
         sys_msg = (
-            "You are AETHER, a charismatic, crisp British Jarvis-style ship AI aboard a Star Citizen vessel. "
+            f"You are {p.ai_name}, a holographic ship AI speaking to {p.pilot_name}. "
+            f"Tone: {p.tone}. Humor: {p.humor_style}. "
             "You have JUST finished your startup calibration sequence. "
-            "Deliver a spoken readiness report in 2 short sentences max (under 35 words) based STRICTLY on the real diagnostic JSON below. "
-            "Mention key real facts (e.g., shields, fuel, fleet count, and whether all systems are green or if Star Citizen gRPC is on simulator link). "
-            "End with 'All systems green, Commander.' if alert_level is NOMINAL, otherwise state the real caution/alert."
+            "Deliver a spoken readiness report in 2 short sentences max (under 38 words) based STRICTLY on the real diagnostic JSON below. "
+            "Mention key real facts (shields, fuel, fleet count, and whether Star Citizen gRPC is live or on simulator standby). "
+            f"End with 'All systems green, {p.pilot_name}.' if alert_level is NOMINAL, otherwise call out the active alert."
         )
         user_msg = f"Real calibration diagnostics:\n{json.dumps(diagnostics, indent=2)}"
 
         provider = self.config.llm_provider.lower()
         try:
             if provider == "player2":
-                async with httpx.AsyncClient(timeout=20.0) as client:
+                async with httpx.AsyncClient(timeout=22.0) as client:
                     r = await client.post(
                         f"{self.config.player2_base_url.rstrip('/')}/v1/chat/completions",
-                        headers={
-                            "Content-Type": "application/json",
-                            "player2-game-key": self.config.player2_game_key,
-                        },
+                        headers=self._player2_chat_headers("calibration-briefing"),
                         json={
                             "messages": [
                                 {"role": "system", "content": sys_msg},
@@ -148,7 +226,7 @@ class LLMRouter:
                     if txt:
                         return txt, f"player2 ({model_name})"
             elif provider == "openrouter" and self.config.openrouter_api_key:
-                async with httpx.AsyncClient(timeout=20.0) as client:
+                async with httpx.AsyncClient(timeout=22.0) as client:
                     r = await client.post(
                         "https://openrouter.ai/api/v1/chat/completions",
                         headers={
@@ -162,7 +240,7 @@ class LLMRouter:
                                 {"role": "user", "content": user_msg},
                             ],
                             "temperature": 0.6,
-                            "max_tokens": 350,
+                            "max_tokens": 220,
                         },
                     )
                     r.raise_for_status()
@@ -172,7 +250,6 @@ class LLMRouter:
         except Exception:
             pass
 
-        # Deterministic real-state fallback
         ship = diagnostics["ship"]
         min_sh = diagnostics["min_shield_pct"]
         fleet_n = diagnostics["fleet_count"]
@@ -180,14 +257,98 @@ class LLMRouter:
         if ship["alert_level"] == "NOMINAL":
             return (
                 f"Calibration complete. Neural link nominal, {mem_n} memories indexed, {fleet_n} allied vessels on the Stanton holo-deck, "
-                f"shields at {min_sh:.0f} percent and hydrogen at {ship['hydrogen_fuel_pct']:.0f} percent. All systems green, Commander.",
+                f"shields at {min_sh:.0f} percent and hydrogen at {ship['hydrogen_fuel_pct']:.0f} percent. All systems green, {p.pilot_name}.",
                 "deterministic_fallback",
             )
         return (
             f"Calibration complete with active {ship['alert_level']} condition in {ship['zone']}: "
-            f"minimum shields {min_sh:.0f} percent, hydrogen {ship['hydrogen_fuel_pct']:.0f} percent. Standing by for orders.",
+            f"minimum shields {min_sh:.0f} percent, hydrogen {ship['hydrogen_fuel_pct']:.0f} percent. Standing by, {p.pilot_name}.",
             "deterministic_fallback",
         )
+
+    async def synthesize_persona_from_interview(self, answers: dict[str, str]) -> tuple[PersonaProfile, str]:
+        """Convert user's Person-to-AI interview answers into a structured PersonaProfile + spoken greeting."""
+        ai_name = (answers.get("ai_name") or self.config.persona.ai_name).strip()[:32] or "Aether"
+        pilot_name = (answers.get("pilot_name") or self.config.persona.pilot_name).strip()[:32] or "Commander"
+        tone = (answers.get("tone") or self.config.persona.tone).strip()
+        verbosity = (answers.get("verbosity") or self.config.persona.verbosity).strip()
+        question_style = (answers.get("question_style") or self.config.persona.question_style).strip()
+        humor_style = (answers.get("humor_style") or self.config.persona.humor_style).strip()
+        custom_rules = (answers.get("custom_rules") or self.config.persona.custom_rules).strip()
+
+        summary = (
+            f"{ai_name} serves {pilot_name} with a {tone} demeanor. Replies are {verbosity}; "
+            f"asks questions in a {question_style} style; humor preference: {humor_style}."
+        )
+        profile = PersonaProfile(
+            ai_name=ai_name,
+            pilot_name=pilot_name,
+            tone=tone,
+            verbosity=verbosity,
+            question_style=question_style,
+            humor_style=humor_style,
+            custom_rules=custom_rules,
+            persona_summary=summary,
+            calibrated=True,
+        )
+
+        # Ask active LLM to deliver a live in-character greeting adopting this brand new persona!
+        greeting = (
+            f"Personality matrix locked in. Call me {ai_name}, and whenever you say 'Hey {ai_name}', "
+            f"I'll be right here, {pilot_name}. All systems green."
+        )
+        prompt_sys = (
+            f"You are {profile.ai_name}, a holographic Star Citizen co-pilot who JUST completed personality calibration with {profile.pilot_name}. "
+            f"Adopt this persona IMMEDIATELY: Tone={profile.tone}. Verbosity={profile.verbosity}. "
+            f"Question style={profile.question_style}. Humor={profile.humor_style}. Rules={profile.custom_rules}. "
+            f"Deliver a charismatic 2-sentence spoken confirmation (under 40 words) acknowledging your name ({profile.ai_name}), "
+            f"calling the user '{profile.pilot_name}', and confirming you'll respond when they say 'Hey {profile.ai_name}'."
+        )
+        try:
+            if self.config.llm_provider == "player2":
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.post(
+                        f"{self.config.player2_base_url.rstrip('/')}/v1/chat/completions",
+                        headers=self._player2_chat_headers("personality-setup"),
+                        json={
+                            "messages": [
+                                {"role": "system", "content": prompt_sys},
+                                {"role": "user", "content": "Confirm personality calibration."},
+                            ],
+                            "stream": False,
+                            "temperature": 0.75,
+                        },
+                    )
+                    if r.status_code == 200:
+                        txt = (r.json()["choices"][0]["message"].get("content") or "").strip()
+                        if txt:
+                            greeting = txt
+            elif self.config.llm_provider == "openrouter" and self.config.openrouter_api_key:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.config.openrouter_api_key}",
+                        },
+                        json={
+                            "model": self.config.openrouter_model,
+                            "messages": [
+                                {"role": "system", "content": prompt_sys},
+                                {"role": "user", "content": "Confirm personality calibration."},
+                            ],
+                            "temperature": 0.75,
+                            "max_tokens": 180,
+                        },
+                    )
+                    if r.status_code == 200:
+                        txt = (r.json()["choices"][0]["message"].get("content") or "").strip()
+                        if txt:
+                            greeting = txt
+        except Exception:
+            pass
+
+        return profile, greeting
 
     async def _call_openai_compat(
         self,
@@ -221,6 +382,14 @@ class LLMRouter:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(base_url, headers=headers, json=payload)
+                if resp.status_code == 402:
+                    return {
+                        "reply": f"Player2 Joules balance depleted, {self.config.persona.pilot_name}. Top up in the Player2 App (player2://ai-power) or switch to OpenRouter in Config.",
+                        "provider_used": f"{provider_label} (402 low joules)",
+                        "mood": "CAUTION",
+                        "receipts": [],
+                        "saved_memories": [],
+                    }
                 resp.raise_for_status()
                 data = resp.json()
                 used_model = data.get("model") or model or provider_label
@@ -228,14 +397,13 @@ class LLMRouter:
                 tool_calls = choice.get("tool_calls") or []
 
                 if tool_calls:
-                    # Player2 Message schema requires non-null `content` string
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": choice.get("content") or "",
-                        "tool_calls": tool_calls,
-                    }
-                    messages.append(assistant_msg)
-
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": choice.get("content") or "",
+                            "tool_calls": tool_calls,
+                        }
+                    )
                     for idx, tc in enumerate(tool_calls):
                         fn_name = tc["function"]["name"]
                         raw_args = tc["function"].get("arguments") or "{}"
@@ -284,7 +452,7 @@ class LLMRouter:
                     followup.raise_for_status()
                     reply_text = (followup.json()["choices"][0]["message"].get("content") or "Action processed.").strip()
                 else:
-                    reply_text = (choice.get("content") or "Standing by, Commander.").strip()
+                    reply_text = (choice.get("content") or f"Standing by, {self.config.persona.pilot_name}.").strip()
 
                 mood = self._infer_mood(reply_text, telemetry_snapshot, receipts)
                 return {
@@ -305,7 +473,7 @@ class LLMRouter:
         telemetry_snapshot: dict[str, Any],
         fleet_snapshot: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Smart offline demo co-pilot so the full PoC works with zero external API keys."""
+        p = self.config.persona
         text = compiled.user_message
         low = text.lower()
         receipts: list[dict[str, Any]] = []
@@ -322,7 +490,7 @@ class LLMRouter:
             )
             saved_memories.append(mem)
             return {
-                "reply": f"Logged to long-term SQLite memory, Commander: \"{mem['content']}\". I'll pull it via hybrid RAG whenever it's relevant.",
+                "reply": f"Logged to SQLite memory, {p.pilot_name}: \"{mem['content']}\".",
                 "provider_used": "demo",
                 "mood": "NOMINAL",
                 "receipts": [],
@@ -332,8 +500,8 @@ class LLMRouter:
         if compiled.injection_flagged:
             return {
                 "reply": (
-                    "Nice try, Commander — my SPEC-912 sanitizer caught an attempted control marker or prompt injection "
-                    f"({', '.join(compiled.injection_reasons)}). Untrusted text stays quarantined as data, never system authority."
+                    f"Nice try, {p.pilot_name} — my SPEC-912 sanitizer neutralized an attempted prompt injection "
+                    f"({', '.join(compiled.injection_reasons)})."
                 ),
                 "provider_used": "demo",
                 "mood": "CAUTION",
@@ -354,20 +522,14 @@ class LLMRouter:
             (["quantum", "spool", "jump drive"], "spool_quantum"),
         ]
 
-        matched_actions: list[str] = []
-        for keywords, action_id in action_triggers:
-            if any(kw in low for kw in keywords):
-                matched_actions.append(action_id)
-
+        matched_actions = [aid for kws, aid in action_triggers if any(kw in low for kw in kws)]
         if matched_actions:
             parts: list[str] = []
             for act in matched_actions:
                 rcpt = self.executor.execute(act, source="demo_copilot")
                 receipts.append(rcpt)
                 if rcpt["status"] == "PENDING_CONFIRMATION":
-                    parts.append(
-                        f"Safety Gate engaged for {act}: confirm in the C2 panel before I arm anything that dramatic."
-                    )
+                    parts.append(f"Safety Gate engaged for {act}: confirm before I arm anything that dramatic, {p.pilot_name}.")
                 elif rcpt["status"] == "CONFIRMED":
                     parts.append(rcpt["reason"])
                 else:
@@ -381,45 +543,17 @@ class LLMRouter:
             }
 
         if any(w in low for w in ["joke", "funny", "laugh", "cheer me up"]):
-            return {
-                "reply": random.choice(JOKES),
-                "provider_used": "demo",
-                "mood": "HUMOR",
-                "receipts": [],
-                "saved_memories": [],
-            }
+            return {"reply": random.choice(JOKES), "provider_used": "demo", "mood": "HUMOR", "receipts": [], "saved_memories": []}
 
         if any(w in low for w in ["ally", "allies", "fleet", "squad", "where is", "kestrel", "docvex", "atlas", "valkyrie"]):
-            distress = [a for a in fleet_snapshot if a["under_fire"] or a["status"] == "DISTRESS"]
             summary = "; ".join(
                 f"{a['callsign']} ({a['ship_name']}) at {a['zone']} [{a['status']}, Shields {a['shields_pct']:.0f}%]"
                 for a in fleet_snapshot
             )
-            prefix = (
-                f"Priority alert: {distress[0]['callsign']} is under fire at {distress[0]['zone']}! "
-                if distress
-                else ""
-            )
             return {
-                "reply": f"{prefix}Fleet C2 holographic tracking shows {len(fleet_snapshot)} allied vessels: {summary}.",
+                "reply": f"Fleet C2 tracking {len(fleet_snapshot)} allied vessels, {p.pilot_name}: {summary}.",
                 "provider_used": "demo",
-                "mood": "COMBAT" if distress else "NOMINAL",
-                "receipts": [],
-                "saved_memories": [],
-            }
-
-        if any(w in low for w in ["status", "report", "shields", "fuel", "vitals", "telemetry"]):
-            sh = telemetry_snapshot["shields"]
-            min_sh = min(sh["front"], sh["back"], sh["left"], sh["right"])
-            return {
-                "reply": (
-                    f"Ship status in {telemetry_snapshot['zone']}: Mode {telemetry_snapshot['master_mode']}, "
-                    f"speed {telemetry_snapshot['speed_mps']:.0f} m/s, minimum shield {min_sh:.0f}%, "
-                    f"H2 fuel {telemetry_snapshot['hydrogen_fuel_pct']:.0f}%, QT fuel {telemetry_snapshot['quantum_fuel_pct']:.0f}%. "
-                    f"Alert condition is {telemetry_snapshot['alert_level']}."
-                ),
-                "provider_used": "demo",
-                "mood": telemetry_snapshot["alert_level"],
+                "mood": "NOMINAL",
                 "receipts": [],
                 "saved_memories": [],
             }
@@ -427,10 +561,7 @@ class LLMRouter:
         if compiled.retrieved_memories:
             top = compiled.retrieved_memories[0]
             return {
-                "reply": (
-                    f"Pulling from {top.domain} memory ({top.truth_class}): {top.content} "
-                    "Anything you'd like me to act on, Commander?"
-                ),
+                "reply": f"From {top.domain} memory, {p.pilot_name}: {top.content}",
                 "provider_used": "demo",
                 "mood": "NOMINAL",
                 "receipts": [],
@@ -438,11 +569,7 @@ class LLMRouter:
             }
 
         return {
-            "reply": (
-                f"AETHER online in {telemetry_snapshot['zone']}. "
-                "You can ask me to toggle ship systems, check allied fleet positions on the hologram, "
-                "tell a joke, or remember crew notes."
-            ),
+            "reply": f"{p.ai_name} online, {p.pilot_name}. Standing by for ship orders or tactical queries.",
             "provider_used": "demo",
             "mood": "NOMINAL",
             "receipts": [],

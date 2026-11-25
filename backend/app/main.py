@@ -1,4 +1,4 @@
-"""AETHER FastAPI Server — Telemetry WebSocket, Fleet Relay Hub, RAG Memory, Player2 LLM, ElevenLabs TTS & Calibration."""
+"""AETHER FastAPI Server (v0.3.0) — Strict Player2 60s Heartbeat, Own ElevenLabs, Persona Interview & Telemetry."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .config import AetherConfig
+from .config import AetherConfig, PersonaProfile
 from .llm.router import LLMRouter
 from .rag.compiler import PromptCompiler
 from .rag.store import MemoryStore
@@ -53,11 +53,22 @@ class ScenarioRequest(BaseModel):
     scenario: str
 
 
+class PersonaInterviewRequest(BaseModel):
+    ai_name: str = "Aether"
+    pilot_name: str = "Commander"
+    tone: str = ""
+    verbosity: str = ""
+    question_style: str = ""
+    humor_style: str = ""
+    custom_rules: str = ""
+
+
 class ConfigUpdateRequest(BaseModel):
     llm_provider: str | None = None
     player2_base_url: str | None = None
     player2_mcp_url: str | None = None
     player2_game_key: str | None = None
+    player2_model: str | None = None
     openrouter_api_key: str | None = None
     openrouter_model: str | None = None
     tts_provider: str | None = None
@@ -67,11 +78,12 @@ class ConfigUpdateRequest(BaseModel):
     telemetry_mode: str | None = None
     proactive_alerts_enabled: bool | None = None
     tts_enabled: bool | None = None
+    wake_word_enabled: bool | None = None
 
 
 class AetherRuntime:
     def __init__(self) -> None:
-        self.config = AetherConfig()
+        self.config = AetherConfig.load_or_default()
         self.store = MemoryStore(self.config.db_path)
         self.compiler = PromptCompiler(self.store)
         self.executor = ActionExecutor(self.store)
@@ -84,6 +96,7 @@ class AetherRuntime:
         self.recent_history: list[dict[str, str]] = []
         self.ui_clients: set[WebSocket] = set()
         self._telemetry_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
         self.last_calibration: dict[str, Any] | None = None
 
         self.executor.set_dispatch_handler(self._dispatch_game_action)
@@ -93,19 +106,27 @@ class AetherRuntime:
             return self.grpc_bridge.dispatch_action(action_id, params)
         return self.simulator.apply_action(action_id, params)
 
-    async def start_telemetry_loop(self) -> None:
+    async def start_background_tasks(self) -> None:
         self._telemetry_task = asyncio.create_task(self._telemetry_loop())
+        self._heartbeat_task = asyncio.create_task(self._player2_heartbeat_loop())
 
-    async def stop_telemetry_loop(self) -> None:
-        if self._telemetry_task:
-            self._telemetry_task.cancel()
-            try:
-                await self._telemetry_task
-            except asyncio.CancelledError:
-                pass
+    async def stop_background_tasks(self) -> None:
+        for task in (self._telemetry_task, self._heartbeat_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _player2_heartbeat_loop(self) -> None:
+        """Official Player2 API requirement: ping GET /v1/health with player2-game-key every 60 seconds."""
+        while True:
+            hb = await self.voice.send_player2_heartbeat()
+            await self.broadcast({"type": "player2_heartbeat", "heartbeat": hb})
+            await asyncio.sleep(60.0)
 
     async def _telemetry_loop(self) -> None:
-        # ~17 Hz native Star Citizen cadence (~58ms)
         while True:
             ship, fleet = self.simulator.step()
             events = self.triggers.evaluate(ship, fleet) if self.config.proactive_alerts_enabled else []
@@ -128,6 +149,7 @@ class AetherRuntime:
                 "fleet": [a.model_dump() for a in fleet],
                 "events": [e.model_dump() for e in events],
                 "pending_confirmations": self.executor.list_pending(),
+                "heartbeat": self.voice.heartbeat_state,
                 "grpc_status": {
                     "mode": self.config.telemetry_mode,
                     "target": self.config.grpc_target,
@@ -159,12 +181,11 @@ class AetherRuntime:
             item = {
                 "id": step_id,
                 "label": label,
-                "status": status,  # RUNNING | OK | WARN
+                "status": status,
                 "detail": detail,
                 "progress": progress,
                 "timestamp": time.time(),
             }
-            # Replace existing running step or append
             for idx, existing in enumerate(steps):
                 if existing["id"] == step_id:
                     steps[idx] = item
@@ -173,38 +194,35 @@ class AetherRuntime:
                 steps.append(item)
             await self.broadcast({"type": "calibration_progress", "step": item, "steps": steps})
 
-        # Step 1: Player2 Neural Link & MCP Server
-        await emit_step("player2", "Neural Link & Player2 MCP", "RUNNING", "Probing 127.0.0.1:4315 & MCP :9847...", 15)
+        await emit_step("player2", "Player2 Neural Link, Heartbeat & MCP", "RUNNING", "Sending heartbeat ping & probing MCP...", 15)
         p2 = await self.voice.probe_player2()
         if p2["api_online"]:
             p2_detail = (
-                f"Player2 v{p2['client_version']} online ({p2['patron_tier'] or 'User'}, "
-                f"{p2['joules']} Joules) | MCP: {p2['mcp_server'] or 'offline'}"
+                f"Player2 v{p2['client_version']} (Mod {self.config.player2_game_key[:8]}..., "
+                f"Heartbeat #{p2['heartbeat']['count']}, {p2['joules']} Joules) | MCP: {p2['mcp_server'] or 'offline'}"
             )
-            await emit_step("player2", "Neural Link & Player2 MCP", "OK", p2_detail, 30)
+            await emit_step("player2", "Player2 Neural Link, Heartbeat & MCP", "OK", p2_detail, 30)
         else:
             await emit_step(
                 "player2",
-                "Neural Link & Player2 MCP",
+                "Player2 Neural Link, Heartbeat & MCP",
                 "WARN",
-                "Player2 local app unreachable on 127.0.0.1:4315 (fallback active)",
+                f"Player2 unreachable at {self.config.player2_base_url} (fallback active)",
                 30,
             )
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(0.3)
 
-        # Step 2: ElevenLabs Voice Synthesis
-        await emit_step("voice", "ElevenLabs Voice Matrix", "RUNNING", "Checking ElevenLabs vocal profiles...", 45)
-        voices = await self.voice.list_voices()
+        await emit_step("voice", "ElevenLabs Voice Matrix", "RUNNING", "Verifying ElevenLabs vocal profiles...", 45)
+        v_res = await self.voice.list_voices()
+        voices = v_res.get("voices", [])
         selected_voice = next((v for v in voices if v["voice_id"] == self.config.elevenlabs_voice_id), None)
-        voice_name = selected_voice["name"] if selected_voice else self.config.elevenlabs_voice_id[:12]
-        if p2["elevenlabs_voices_count"] > 0 or (
-            self.config.tts_provider == "elevenlabs_direct" and self.config.elevenlabs_api_key
-        ):
+        voice_name = selected_voice["display_name"] if selected_voice else self.config.elevenlabs_voice_id[:12]
+        if v_res.get("account_connected") and voices:
             await emit_step(
                 "voice",
                 "ElevenLabs Voice Matrix",
                 "OK",
-                f"Voice '{voice_name}' locked via {self.config.tts_provider} ({len(voices)} voices available)",
+                f"Voice '{voice_name}' ready via {self.config.tts_provider} ({len(voices)} voices)",
                 55,
             )
         else:
@@ -212,26 +230,25 @@ class AetherRuntime:
                 "voice",
                 "ElevenLabs Voice Matrix",
                 "WARN",
-                "ElevenLabs proxy offline; browser speech synthesis fallback ready",
+                v_res.get("note", "ElevenLabs unavailable; browser speech fallback ready"),
                 55,
             )
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(0.3)
 
-        # Step 3: SQLite Hybrid Semantic RAG & Injection Shield
-        await emit_step("rag", "SPEC-912 SQLite RAG & Shield", "RUNNING", "Verifying FTS5 BM25 + 512d vector index...", 70)
+        await emit_step("rag", "SPEC-912 SQLite RAG & Persona Matrix", "RUNNING", "Verifying FTS5 BM25 + 512d index...", 70)
         mem_count = len(self.store.list_memories(limit=500))
         audit_count = len(self.store.list_security_audit(limit=50))
         probe_hits = self.store.hybrid_search("Stanton Master Modes", top_k=2)
+        p = self.config.persona
         await emit_step(
             "rag",
-            "SPEC-912 SQLite RAG & Shield",
+            "SPEC-912 SQLite RAG & Persona Matrix",
             "OK",
-            f"{mem_count} memories indexed (FTS5 + 512d RRF verified: {len(probe_hits)} hits, {audit_count} injection blocks logged)",
+            f"{mem_count} memories indexed (RRF hits: {len(probe_hits)}, {audit_count} injection blocks) | Identity: {p.ai_name} -> {p.pilot_name}",
             78,
         )
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(0.3)
 
-        # Step 4: Star Citizen Telemetry & Stanton Fleet C2
         await emit_step("telemetry", "Ship Telemetry & Fleet C2", "RUNNING", "Probing Star Citizen gRPC 127.0.0.1:2942...", 88)
         grpc_info = self.grpc_bridge.status_dict()
         ship = self.simulator.ship
@@ -248,7 +265,6 @@ class AetherRuntime:
         )
         await asyncio.sleep(0.25)
 
-        # Step 5: Player2 LLM Readiness Callout
         await emit_step("ready", "Final Readiness Synthesis", "RUNNING", "Synthesizing live ship readiness briefing...", 96)
         diagnostics = {
             "player2": p2,
@@ -296,14 +312,14 @@ runtime = AetherRuntime()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await runtime.start_telemetry_loop()
+    await runtime.start_background_tasks()
     yield
-    await runtime.stop_telemetry_loop()
+    await runtime.stop_background_tasks()
 
 
 app = FastAPI(
     title="AETHER — Star Citizen AI Companion & Holographic C2 Backend",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -320,10 +336,13 @@ app.add_middleware(
 def health() -> dict[str, Any]:
     return {
         "name": "AETHER",
-        "version": "0.2.0",
+        "version": "0.3.0",
+        "ai_name": runtime.config.persona.ai_name,
+        "pilot_name": runtime.config.persona.pilot_name,
         "llm_provider": runtime.config.llm_provider,
         "tts_provider": runtime.config.tts_provider,
         "telemetry_mode": runtime.config.telemetry_mode,
+        "heartbeat": runtime.voice.heartbeat_state,
         "grpc": runtime.grpc_bridge.status_dict(),
         "memory_count": len(runtime.store.list_memories(limit=500)),
         "fleet_count": len(runtime.simulator.allies),
@@ -335,13 +354,28 @@ async def player2_status() -> dict[str, Any]:
     return await runtime.voice.probe_player2()
 
 
+@app.post("/api/player2/heartbeat")
+async def trigger_heartbeat() -> dict[str, Any]:
+    return await runtime.voice.send_player2_heartbeat()
+
+
+@app.get("/api/llm/models")
+async def llm_models(provider: str | None = None) -> dict[str, Any]:
+    prov = (provider or runtime.config.llm_provider).lower()
+    models = await runtime.llm.list_models(prov)
+    selected = runtime.config.player2_model if prov == "player2" else runtime.config.openrouter_model
+    return {"provider": prov, "selected_model": selected, "models": models}
+
+
 @app.get("/api/tts/voices")
-async def tts_voices() -> dict[str, Any]:
-    voices = await runtime.voice.list_voices()
+async def tts_voices(provider: str | None = None) -> dict[str, Any]:
+    res = await runtime.voice.list_voices(provider)
     return {
-        "tts_provider": runtime.config.tts_provider,
+        "tts_provider": res["provider"],
+        "account_connected": res["account_connected"],
+        "note": res.get("note"),
         "selected_voice_id": runtime.config.elevenlabs_voice_id,
-        "voices": voices,
+        "voices": res["voices"],
     }
 
 
@@ -366,6 +400,40 @@ async def calibrate() -> dict[str, Any]:
     return await runtime.run_calibration()
 
 
+@app.get("/api/persona")
+def get_persona() -> dict[str, Any]:
+    return runtime.config.persona.model_dump()
+
+
+@app.post("/api/persona")
+def save_persona(profile: PersonaProfile) -> dict[str, Any]:
+    runtime.config.persona = profile
+    runtime.config.save_to_disk()
+    runtime.store.add_memory(
+        content=f"Personality calibration updated: AI name={profile.ai_name}, Pilot={profile.pilot_name}, Tone={profile.tone}, Humor={profile.humor_style}.",
+        domain="preference",
+        truth_class="firsthand_observation",
+        provenance="persona_calibration",
+        semantic_key="persona.active_profile",
+    )
+    return runtime.config.persona.model_dump()
+
+
+@app.post("/api/persona/interview/complete")
+async def complete_persona_interview(req: PersonaInterviewRequest) -> dict[str, Any]:
+    profile, greeting = await runtime.llm.synthesize_persona_from_interview(req.model_dump())
+    runtime.config.persona = profile
+    runtime.config.save_to_disk()
+    runtime.store.add_memory(
+        content=f"Personality interview completed: {profile.persona_summary} Rules: {profile.custom_rules}",
+        domain="preference",
+        truth_class="firsthand_observation",
+        provenance="persona_interview",
+        semantic_key="persona.active_profile",
+    )
+    return {"persona": profile.model_dump(), "greeting": greeting}
+
+
 @app.get("/api/config")
 async def get_config() -> dict[str, Any]:
     data = runtime.config.model_dump()
@@ -382,6 +450,7 @@ async def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
     for key, val in updates.items():
         if hasattr(runtime.config, key):
             setattr(runtime.config, key, val)
+    runtime.config.save_to_disk()
     return await get_config()
 
 
@@ -399,6 +468,7 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
         recent_history=runtime.recent_history,
         pilot_callsign=runtime.config.pilot_callsign,
         ship_name=runtime.config.ship_name,
+        persona=runtime.config.persona,
     )
 
     result = await runtime.llm.respond(

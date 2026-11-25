@@ -1,13 +1,29 @@
 import React, { useEffect, useState } from "react";
-import { ActionReceipt, AetherConfigData, RetrievedMemoryHit, ShipTelemetry, VoiceOption } from "../types";
+import { Sparkles, HeartPulse } from "lucide-react";
+import {
+  ActionReceipt,
+  AetherConfigData,
+  HeartbeatState,
+  LLMModelOption,
+  PersonaProfile,
+  RetrievedMemoryHit,
+  ShipTelemetry,
+  VoiceOption,
+} from "../types";
 
 interface InspectorPanelProps {
   ship: ShipTelemetry;
   config: AetherConfigData | null;
+  heartbeat: HeartbeatState | null;
   voices: VoiceOption[];
+  voicesNote: string | null;
   onExecuteAction: (actionId: string) => void;
   onTriggerScenario: (scenario: string) => void;
-  onSaveConfig: (patch: Record<string, unknown>) => void;
+  onSaveConfig: (patch: Record<string, unknown>) => Promise<void>;
+  onSavePersona: (profile: PersonaProfile) => Promise<void>;
+  onOpenPersonaInterview: () => void;
+  onPingHeartbeat: () => Promise<void>;
+  onRefreshVoices: (providerOverride?: string) => Promise<void>;
   onTestVoice: () => void;
   refreshTick: number;
 }
@@ -15,14 +31,20 @@ interface InspectorPanelProps {
 export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   ship,
   config,
+  heartbeat,
   voices,
+  voicesNote,
   onExecuteAction,
   onTriggerScenario,
   onSaveConfig,
+  onSavePersona,
+  onOpenPersonaInterview,
+  onPingHeartbeat,
+  onRefreshVoices,
   onTestVoice,
   refreshTick,
 }) => {
-  const [tab, setTab] = useState<"systems" | "rag" | "receipts" | "config">("systems");
+  const [tab, setTab] = useState<"systems" | "rag" | "receipts" | "persona" | "config">("systems");
   const [memories, setMemories] = useState<RetrievedMemoryHit[]>([]);
   const [ragQuery, setRagQuery] = useState("");
   const [newMem, setNewMem] = useState("");
@@ -30,24 +52,59 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
 
   // Config form state
   const [provider, setProvider] = useState("player2");
+  const [llmModels, setLlmModels] = useState<LLMModelOption[]>([]);
+  const [player2Model, setPlayer2Model] = useState("");
+  const [openRouterModel, setOpenRouterModel] = useState("anthropic/claude-3.7-sonnet");
+  const [openRouterCustomModel, setOpenRouterCustomModel] = useState("");
+  const [openRouterKey, setOpenRouterKey] = useState("");
+  const [player2Url, setPlayer2Url] = useState("http://127.0.0.1:4315");
+  const [player2ModId, setPlayer2ModId] = useState("01a21115-8912-7b68-a847-f7b8e80a6afc");
+
   const [ttsProvider, setTtsProvider] = useState("player2_elevenlabs");
   const [voiceId, setVoiceId] = useState("01955d76-ed5b-754f-a070-a570ddfed516");
+  const [elevenModelId, setElevenModelId] = useState("eleven_multilingual_v2");
   const [elevenKey, setElevenKey] = useState("");
   const [telemetryMode, setTelemetryMode] = useState("simulator");
-  const [openRouterKey, setOpenRouterKey] = useState("");
-  const [openRouterModel, setOpenRouterModel] = useState("anthropic/claude-3.7-sonnet");
-  const [player2Url, setPlayer2Url] = useState("http://127.0.0.1:4315");
+  const [wakeWordEnabled, setWakeWordEnabled] = useState(true);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
+
+  // Persona edit state
+  const [personaDraft, setPersonaDraft] = useState<PersonaProfile | null>(null);
 
   useEffect(() => {
     if (config) {
       setProvider(config.llm_provider);
-      setTtsProvider(config.tts_provider);
-      setVoiceId(config.elevenlabs_voice_id);
-      setTelemetryMode(config.telemetry_mode);
+      setPlayer2Model(config.player2_model || "");
       setOpenRouterModel(config.openrouter_model);
       setPlayer2Url(config.player2_base_url);
+      setPlayer2ModId(config.player2_game_key);
+      setTtsProvider(config.tts_provider);
+      setVoiceId(config.elevenlabs_voice_id);
+      setElevenModelId(config.elevenlabs_model_id || "eleven_multilingual_v2");
+      setTelemetryMode(config.telemetry_mode);
+      setWakeWordEnabled(config.wake_word_enabled);
+      setPersonaDraft(config.persona);
     }
   }, [config]);
+
+  const loadModelsForProvider = async (prov: string) => {
+    try {
+      const res = await fetch(`/api/llm/models?provider=${encodeURIComponent(prov)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setLlmModels(data.models || []);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    if (tab === "config") {
+      loadModelsForProvider(provider);
+      onRefreshVoices(ttsProvider);
+    }
+  }, [tab, provider, ttsProvider]);
 
   const loadMemories = async (q?: string) => {
     const url = q ? `/api/memories?q=${encodeURIComponent(q)}` : "/api/memories";
@@ -83,7 +140,34 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
     loadMemories(ragQuery || undefined);
   };
 
+  const applyConfig = async () => {
+    const chosenOpenRouterModel = openRouterCustomModel.trim() || openRouterModel;
+    const patch: Record<string, unknown> = {
+      llm_provider: provider,
+      player2_base_url: player2Url,
+      player2_game_key: player2ModId.trim(),
+      player2_model: player2Model,
+      openrouter_model: chosenOpenRouterModel,
+      tts_provider: ttsProvider,
+      elevenlabs_voice_id: voiceId,
+      elevenlabs_model_id: elevenModelId,
+      telemetry_mode: telemetryMode,
+      wake_word_enabled: wakeWordEnabled,
+    };
+    if (openRouterKey.trim()) patch.openrouter_api_key = openRouterKey.trim();
+    if (elevenKey.trim()) patch.elevenlabs_api_key = elevenKey.trim();
+
+    await onSaveConfig(patch);
+    setOpenRouterKey("");
+    setElevenKey("");
+    setOpenRouterCustomModel("");
+    await onRefreshVoices(ttsProvider);
+    setSaveNotice("Configuration saved locally!");
+    window.setTimeout(() => setSaveNotice(null), 2600);
+  };
+
   const barClass = (pct: number) => (pct < 30 ? "crit" : pct < 60 ? "warn" : "");
+  const hb = heartbeat || config?.player2_status?.heartbeat || null;
 
   return (
     <div className="panel" style={{ height: "100%" }}>
@@ -92,10 +176,13 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
           Systems
         </button>
         <button className={`tab-btn ${tab === "rag" ? "active" : ""}`} onClick={() => setTab("rag")}>
-          SQLite RAG
+          RAG
         </button>
         <button className={`tab-btn ${tab === "receipts" ? "active" : ""}`} onClick={() => setTab("receipts")}>
           Receipts
+        </button>
+        <button className={`tab-btn ${tab === "persona" ? "active" : ""}`} onClick={() => setTab("persona")}>
+          Persona
         </button>
         <button className={`tab-btn ${tab === "config" ? "active" : ""}`} onClick={() => setTab("config")}>
           Config
@@ -281,68 +368,205 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
           </>
         )}
 
+        {tab === "persona" && personaDraft && (
+          <div className="card">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div className="card-title" style={{ marginBottom: 0 }}>
+                AI Identity &amp; Personality Matrix
+              </div>
+              <button className="btn amber" onClick={onOpenPersonaInterview}>
+                <Sparkles size={12} /> INTERVIEW SETUP
+              </button>
+            </div>
+
+            <div className="field-group">
+              <label>AI Name (Wake Word: "Hey ...")</label>
+              <input
+                className="text-input"
+                value={personaDraft.ai_name}
+                onChange={(e) => setPersonaDraft({ ...personaDraft, ai_name: e.target.value })}
+              />
+            </div>
+            <div className="field-group">
+              <label>Your Name / Title (How AI greets you)</label>
+              <input
+                className="text-input"
+                value={personaDraft.pilot_name}
+                onChange={(e) => setPersonaDraft({ ...personaDraft, pilot_name: e.target.value })}
+              />
+            </div>
+            <div className="field-group">
+              <label>Demeanor &amp; Tone</label>
+              <input
+                className="text-input"
+                value={personaDraft.tone}
+                onChange={(e) => setPersonaDraft({ ...personaDraft, tone: e.target.value })}
+              />
+            </div>
+            <div className="field-group">
+              <label>Reply Length &amp; Cadence</label>
+              <input
+                className="text-input"
+                value={personaDraft.verbosity}
+                onChange={(e) => setPersonaDraft({ ...personaDraft, verbosity: e.target.value })}
+              />
+            </div>
+            <div className="field-group">
+              <label>Humor &amp; Banter Style</label>
+              <input
+                className="text-input"
+                value={personaDraft.humor_style}
+                onChange={(e) => setPersonaDraft({ ...personaDraft, humor_style: e.target.value })}
+              />
+            </div>
+            <div className="field-group">
+              <label>Custom Pilot Rules &amp; Habits</label>
+              <input
+                className="text-input"
+                value={personaDraft.custom_rules}
+                onChange={(e) => setPersonaDraft({ ...personaDraft, custom_rules: e.target.value })}
+              />
+            </div>
+
+            <button
+              className="btn active"
+              style={{ width: "100%", justifyContent: "center", marginTop: 6 }}
+              onClick={() => onSavePersona({ ...personaDraft, calibrated: true })}
+            >
+              SAVE PERSONALITY MATRIX
+            </button>
+          </div>
+        )}
+
         {tab === "config" && (
           <>
-            {config?.player2_status && (
-              <div className="card">
-                <div className="card-title">Live Player2 Link (4315 / MCP 9847)</div>
-                <div style={{ fontSize: 11.5, lineHeight: 1.6, color: "#cbd5e1" }}>
-                  <div>
-                    API:{" "}
-                    <strong style={{ color: config.player2_status.api_online ? "#6ee7b7" : "#fca5a5" }}>
-                      {config.player2_status.api_online
-                        ? `ONLINE (v${config.player2_status.client_version})`
-                        : "OFFLINE"}
-                    </strong>
-                  </div>
-                  {config.player2_status.joules !== null && (
-                    <div>
-                      Account: {config.player2_status.patron_tier} · {config.player2_status.joules} Joules
-                    </div>
-                  )}
-                  <div>
-                    MCP Server:{" "}
-                    <strong style={{ color: config.player2_status.mcp_online ? "#6ee7b7" : "#f59e0b" }}>
-                      {config.player2_status.mcp_online ? config.player2_status.mcp_server : "OFFLINE"}
-                    </strong>
-                  </div>
-                  <div>ElevenLabs Voices: {config.player2_status.elevenlabs_voices_count}</div>
+            <div className="card">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <div className="card-title" style={{ marginBottom: 0 }}>
+                  Player2 Link &amp; 60s Heartbeat
                 </div>
+                <button className="btn" onClick={onPingHeartbeat} title="Send immediate /v1/health heartbeat">
+                  <HeartPulse size={12} color="#10b981" /> PING
+                </button>
               </div>
-            )}
+              <div style={{ fontSize: 11, lineHeight: 1.55, color: "#cbd5e1" }}>
+                <div>
+                  API:{" "}
+                  <strong style={{ color: config?.player2_status?.api_online ? "#6ee7b7" : "#fca5a5" }}>
+                    {config?.player2_status?.api_online
+                      ? `ONLINE (v${config.player2_status.client_version})`
+                      : "OFFLINE"}
+                  </strong>{" "}
+                  · Heartbeat:{" "}
+                  <strong style={{ color: hb?.last_ok ? "#6ee7b7" : "#f59e0b" }}>
+                    #{hb?.count ?? 0} (every 60s)
+                  </strong>
+                </div>
+                <div>Mod ID: {config?.player2_game_key}</div>
+                {config?.player2_status?.joules !== null && config?.player2_status?.joules !== undefined && (
+                  <div>
+                    Account: {config.player2_status.patron_tier} · {config.player2_status.joules} Joules · MCP:{" "}
+                    {config.player2_status.mcp_online ? config.player2_status.mcp_server : "OFFLINE"}
+                  </div>
+                )}
+              </div>
+            </div>
 
             <div className="card">
-              <div className="card-title">LLM, ElevenLabs Voice &amp; Telemetry</div>
+              <div className="card-title">1. LLM Brain (Independent Selection)</div>
               <div className="field-group">
-                <label>LLM Decision Backend</label>
+                <label>LLM Provider</label>
                 <select className="select-input" value={provider} onChange={(e) => setProvider(e.target.value)}>
                   <option value="player2">Player2 Local LLM (127.0.0.1:4315)</option>
                   <option value="openrouter">OpenRouter Cloud API</option>
                   <option value="demo">Offline Demo Co-Pilot (Zero Keys)</option>
                 </select>
               </div>
+
+              {provider === "player2" && (
+                <>
+                  <div className="field-group">
+                    <label>Player2 Suggested Model (player2-suggested-model)</label>
+                    <select
+                      className="select-input"
+                      value={player2Model}
+                      onChange={(e) => setPlayer2Model(e.target.value)}
+                    >
+                      {llmModels.map((m) => (
+                        <option key={m.id || "default"} value={m.id}>
+                          {m.name} {m.detail ? `(${m.detail})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field-group">
+                    <label>Player2 Mod / Game Client ID</label>
+                    <input
+                      className="text-input"
+                      value={player2ModId}
+                      onChange={(e) => setPlayer2ModId(e.target.value)}
+                    />
+                  </div>
+                </>
+              )}
+
+              {provider === "openrouter" && (
+                <>
+                  <div className="field-group">
+                    <label>OpenRouter Model</label>
+                    <select
+                      className="select-input"
+                      value={openRouterModel}
+                      onChange={(e) => setOpenRouterModel(e.target.value)}
+                    >
+                      {llmModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} ({m.id})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field-group">
+                    <label>Or Custom OpenRouter Model ID</label>
+                    <input
+                      className="text-input"
+                      placeholder="e.g. anthropic/claude-sonnet-4"
+                      value={openRouterCustomModel}
+                      onChange={(e) => setOpenRouterCustomModel(e.target.value)}
+                    />
+                  </div>
+                  <div className="field-group">
+                    <label>
+                      OpenRouter API Key {config?.openrouter_api_key_set ? "(Saved Locally)" : "(Required)"}
+                    </label>
+                    <input
+                      className="text-input"
+                      type="password"
+                      placeholder="sk-or-v1-..."
+                      value={openRouterKey}
+                      onChange={(e) => setOpenRouterKey(e.target.value)}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="card">
+              <div className="card-title">2. Voice Engine (Own ElevenLabs OR Player2)</div>
               <div className="field-group">
-                <label>TTS Voice Engine</label>
+                <label>TTS Provider</label>
                 <select className="select-input" value={ttsProvider} onChange={(e) => setTtsProvider(e.target.value)}>
-                  <option value="player2_elevenlabs">ElevenLabs via Player2 (Zero Key)</option>
-                  <option value="elevenlabs_direct">Direct ElevenLabs API (Custom Key)</option>
-                  <option value="browser">Browser SpeechSynthesis Fallback</option>
+                  <option value="elevenlabs_direct">My Own ElevenLabs Account (Direct API Key)</option>
+                  <option value="player2_elevenlabs">ElevenLabs via Player2 (Uses Joules)</option>
+                  <option value="browser">Browser SpeechSynthesis (Free Fallback)</option>
                 </select>
               </div>
-              <div className="field-group">
-                <label>ElevenLabs Voice (Jarvis British Male at top)</label>
-                <select className="select-input" value={voiceId} onChange={(e) => setVoiceId(e.target.value)}>
-                  {voices.map((v) => (
-                    <option key={v.voice_id} value={v.voice_id}>
-                      {v.name} {v.accent || v.gender ? `(${v.accent} ${v.gender})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
+
               {ttsProvider === "elevenlabs_direct" && (
                 <div className="field-group">
                   <label>
-                    ElevenLabs API Key {config?.elevenlabs_api_key_set ? "(Configured)" : "(Required for Direct)"}
+                    Your ElevenLabs API Key (xi-api-key){" "}
+                    {config?.elevenlabs_api_key_set ? "(Saved Locally)" : "(Enter Key & Apply)"}
                   </label>
                   <input
                     className="text-input"
@@ -353,29 +577,47 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                   />
                 </div>
               )}
+
+              {ttsProvider !== "browser" && (
+                <>
+                  <div className="field-group">
+                    <label>ElevenLabs Model</label>
+                    <select
+                      className="select-input"
+                      value={elevenModelId}
+                      onChange={(e) => setElevenModelId(e.target.value)}
+                    >
+                      <option value="eleven_multilingual_v2">Eleven Multilingual v2 (Highest Fidelity)</option>
+                      <option value="eleven_flash_v2_5">Eleven Flash v2.5 (Ultra Low-Latency)</option>
+                      <option value="eleven_turbo_v2_5">Eleven Turbo v2.5 (Balanced Speed)</option>
+                    </select>
+                  </div>
+                  <div className="field-group">
+                    <label>Voice Profile ({voices.length} loaded)</label>
+                    <select className="select-input" value={voiceId} onChange={(e) => setVoiceId(e.target.value)}>
+                      {voices.map((v) => (
+                        <option key={v.voice_id} value={v.voice_id}>
+                          {v.display_name || v.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {voicesNote && <div style={{ fontSize: 11, color: "#f59e0b", marginBottom: 6 }}>{voicesNote}</div>}
+                </>
+              )}
+            </div>
+
+            <div className="card">
+              <div className="card-title">3. Wake-Word Gate &amp; Star Citizen Link</div>
               <div className="field-group">
-                <label>Player2 Base URL</label>
-                <input className="text-input" value={player2Url} onChange={(e) => setPlayer2Url(e.target.value)} />
-              </div>
-              <div className="field-group">
-                <label>OpenRouter Model</label>
-                <input
-                  className="text-input"
-                  value={openRouterModel}
-                  onChange={(e) => setOpenRouterModel(e.target.value)}
-                />
-              </div>
-              <div className="field-group">
-                <label>
-                  OpenRouter API Key {config?.openrouter_api_key_set ? "(Configured)" : "(Optional)"}
+                <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                  <input
+                    type="checkbox"
+                    checked={wakeWordEnabled}
+                    onChange={(e) => setWakeWordEnabled(e.target.checked)}
+                  />
+                  Strict Wake-Word Gate (Only reply to "Hey {config?.persona.ai_name || "Aether"}")
                 </label>
-                <input
-                  className="text-input"
-                  type="password"
-                  placeholder="sk-or-v1-..."
-                  value={openRouterKey}
-                  onChange={(e) => setOpenRouterKey(e.target.value)}
-                />
               </div>
               <div className="field-group">
                 <label>Star Citizen Telemetry Source</label>
@@ -389,31 +631,16 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                 </select>
               </div>
               <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-                <button
-                  className="btn active"
-                  style={{ flex: 1, justifyContent: "center" }}
-                  onClick={() => {
-                    const patch: Record<string, unknown> = {
-                      llm_provider: provider,
-                      tts_provider: ttsProvider,
-                      elevenlabs_voice_id: voiceId,
-                      player2_base_url: player2Url,
-                      openrouter_model: openRouterModel,
-                      telemetry_mode: telemetryMode,
-                    };
-                    if (openRouterKey.trim()) patch.openrouter_api_key = openRouterKey.trim();
-                    if (elevenKey.trim()) patch.elevenlabs_api_key = elevenKey.trim();
-                    onSaveConfig(patch);
-                    setOpenRouterKey("");
-                    setElevenKey("");
-                  }}
-                >
-                  APPLY CONFIG
+                <button className="btn active" style={{ flex: 1, justifyContent: "center" }} onClick={applyConfig}>
+                  APPLY &amp; SAVE CONFIG
                 </button>
                 <button className="btn" onClick={onTestVoice}>
                   TEST VOICE
                 </button>
               </div>
+              {saveNotice && (
+                <div style={{ fontSize: 11, color: "#6ee7b7", marginTop: 6, textAlign: "center" }}>{saveNotice}</div>
+              )}
             </div>
           </>
         )}
