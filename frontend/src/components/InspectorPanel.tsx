@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Sparkles, HeartPulse, Music, ShieldCheck, Copy, Users } from "lucide-react";
+import { Sparkles, HeartPulse, Music, ShieldCheck, Copy, Users, BookOpen } from "lucide-react";
 import {
   ActionReceipt,
   AetherConfigData,
@@ -13,8 +13,8 @@ import {
 } from "../types";
 
 interface InspectorPanelProps {
-  activeTab: "systems" | "rag" | "receipts" | "persona" | "config";
-  onTabChange: (tab: "systems" | "rag" | "receipts" | "persona" | "config") => void;
+  activeTab: "systems" | "rag" | "receipts" | "persona" | "config" | "api";
+  onTabChange: (tab: "systems" | "rag" | "receipts" | "persona" | "config" | "api") => void;
   ship: ShipTelemetry;
   config: AetherConfigData | null;
   heartbeat: HeartbeatState | null;
@@ -90,6 +90,16 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   const [relayUrl, setRelayUrl] = useState("ws://127.0.0.1:8785");
   const [lobbyNotice, setLobbyNotice] = useState<string | null>(null);
 
+  // Formatted API Reference state (synced into SQLite Auto-RAG)
+  const [apiDoc, setApiDoc] = useState<{
+    path: string;
+    markdown: string;
+    sections: Array<{ id: string; level: number; title: string; body: string }>;
+    indexed_chunks: number;
+  } | null>(null);
+  const [apiFilter, setApiFilter] = useState("");
+  const [apiCopied, setApiCopied] = useState(false);
+
   // Persona edit state
   const [personaDraft, setPersonaDraft] = useState<PersonaProfile | null>(null);
 
@@ -160,10 +170,20 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
     }
   };
 
+  const loadApiDoc = async () => {
+    try {
+      const res = await fetch("/api/docs/reference");
+      if (res.ok) setApiDoc(await res.json());
+    } catch {
+      // ignore
+    }
+  };
+
   useEffect(() => {
     if (tab === "rag") loadMemories(ragQuery || undefined);
     if (tab === "receipts") loadReceipts();
     if (tab === "systems") loadLobby();
+    if (tab === "api") loadApiDoc();
   }, [tab, refreshTick]);
 
   const createEncryptedLobby = async () => {
@@ -292,6 +312,9 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
         </button>
         <button className={`tab-btn ${tab === "receipts" ? "active" : ""}`} onClick={() => setTab("receipts")}>
           Receipts
+        </button>
+        <button className={`tab-btn ${tab === "api" ? "active" : ""}`} onClick={() => setTab("api")}>
+          API Docs
         </button>
       </div>
 
@@ -1004,6 +1027,135 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                 <div style={{ fontSize: 11, color: "#6ee7b7", marginTop: 6, lineHeight: 1.4 }}>{spotifyNotice}</div>
               )}
             </div>
+          </>
+        )}
+
+        {tab === "api" && (
+          <>
+            <div className="card">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <div className="card-title" style={{ marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                  <BookOpen size={13} color="#5eead4" /> Star Citizen Telemetry &amp; AETHER API Reference
+                </div>
+                <span style={{ fontSize: 10, fontWeight: 700, color: "#5eead4" }}>
+                  {apiDoc?.indexed_chunks ?? 0} RAG CHUNKS LOCKED
+                </span>
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.45, marginBottom: 10 }}>
+                Source: <code>{apiDoc?.path || "docs/STAR_CITIZEN_AND_AETHER_API.md"}</code> — automatically indexed into{" "}
+                {config?.persona?.ai_name || "Aether"}&apos;s SQLite Auto-RAG. Ask him anytime:{" "}
+                <em>&ldquo;What is the Star Citizen Telemetry API?&rdquo;</em> or{" "}
+                <em>&ldquo;What functions does the API expose?&rdquo;</em>
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <input
+                  className="text-input"
+                  placeholder="Filter RPCs, endpoints, or tools (e.g. gRPC, lobby, TriggerGameActions)..."
+                  value={apiFilter}
+                  onChange={(e) => setApiFilter(e.target.value)}
+                />
+                <button
+                  className="btn active"
+                  onClick={() => {
+                    if (apiDoc?.markdown) {
+                      navigator.clipboard?.writeText(apiDoc.markdown);
+                      setApiCopied(true);
+                      window.setTimeout(() => setApiCopied(false), 2000);
+                    }
+                  }}
+                >
+                  <Copy size={12} /> {apiCopied ? "Copied" : "Copy"}
+                </button>
+              </div>
+            </div>
+
+            {(apiDoc?.sections || [])
+              .filter((sec) => {
+                const q = apiFilter.trim().toLowerCase();
+                if (!q) return true;
+                return sec.title.toLowerCase().includes(q) || sec.body.toLowerCase().includes(q);
+              })
+              .map((sec) => {
+                const lines = sec.body.split("\n");
+                const tableLines = lines.filter((l) => l.trim().startsWith("|"));
+                const proseLines = lines.filter((l) => !l.trim().startsWith("|") && l.trim().length > 0);
+                const tableRows = tableLines
+                  .filter((l) => !/^\|\s*-+/.test(l.trim()))
+                  .map((l) =>
+                    l
+                      .trim()
+                      .replace(/^\|/, "")
+                      .replace(/\|$/, "")
+                      .split("|")
+                      .map((c) => c.trim().replace(/\\\|/g, "|"))
+                  );
+                const headerRow = tableRows[0] || [];
+                const bodyRows = tableRows.slice(1);
+
+                return (
+                  <div key={sec.id} className="card">
+                    <div className="card-title" style={{ fontSize: sec.level === 2 ? 11.5 : 10.5 }}>
+                      {sec.title}
+                    </div>
+                    {proseLines.length > 0 && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: bodyRows.length ? 10 : 0 }}>
+                        {proseLines.map((pl, idx) => (
+                          <div key={idx} style={{ fontSize: 11.5, color: "#cbd5e1", lineHeight: 1.5 }}>
+                            {pl.replace(/\*\*/g, "").replace(/`/g, "")}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {bodyRows.length > 0 && (
+                      <div style={{ overflowX: "auto" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                          <thead>
+                            <tr>
+                              {headerRow.map((h, i) => (
+                                <th
+                                  key={i}
+                                  style={{
+                                    textAlign: "left",
+                                    padding: "6px 8px",
+                                    borderBottom: "1px solid rgba(94, 234, 212, 0.22)",
+                                    color: "var(--teal-dim)",
+                                    fontSize: 9.5,
+                                    letterSpacing: "0.1em",
+                                    textTransform: "uppercase",
+                                  }}
+                                >
+                                  {h}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {bodyRows.map((row, ri) => (
+                              <tr key={ri} style={{ borderBottom: "1px solid rgba(94, 234, 212, 0.08)" }}>
+                                {row.map((cell, ci) => (
+                                  <td
+                                    key={ci}
+                                    style={{
+                                      padding: "7px 8px",
+                                      verticalAlign: "top",
+                                      color: ci === 0 ? "var(--teal-bright)" : "#cbd5e1",
+                                      fontFamily: ci === 0 ? "Consolas, monospace" : "inherit",
+                                      fontSize: ci === 0 ? 11 : 11.5,
+                                      lineHeight: 1.45,
+                                    }}
+                                  >
+                                    {cell.replace(/\*\*/g, "").replace(/`/g, "")}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
           </>
         )}
       </div>

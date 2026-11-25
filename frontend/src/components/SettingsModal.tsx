@@ -12,8 +12,8 @@ import {
 
 interface SettingsModalProps {
   visible: boolean;
-  activeTab: "systems" | "rag" | "receipts" | "persona" | "config";
-  onTabChange: (tab: "systems" | "rag" | "receipts" | "persona" | "config") => void;
+  activeTab: "systems" | "rag" | "receipts" | "persona" | "config" | "api";
+  onTabChange: (tab: "systems" | "rag" | "receipts" | "persona" | "config" | "api") => void;
   ship: ShipTelemetry;
   config: AetherConfigData | null;
   heartbeat: HeartbeatState | null;

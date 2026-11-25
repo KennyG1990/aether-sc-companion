@@ -339,5 +339,22 @@ def test_encrypted_squad_lobby_e2e_and_zero_chat_privacy_firewall() -> None:
     assert "ALLY_INCOMING_MISSILE" in ev_types
 
 
+def test_api_reference_doc_indexes_idempotently_and_retrieves_via_rag(tmp_path: Path) -> None:
+    store = MemoryStore(str(tmp_path / "api_doc.db"))
+    doc_path = Path(__file__).resolve().parents[2] / "docs" / "STAR_CITIZEN_AND_AETHER_API.md"
+    assert doc_path.is_file()
+
+    first_count = store.sync_api_reference_doc(doc_path)
+    assert first_count >= 8
+    # Running again must be idempotent (0 duplicate writes)
+    second_count = store.sync_api_reference_doc(doc_path)
+    assert second_count == 0
+
+    hits = store.hybrid_search("What functions does the Star Citizen Telemetry API expose?")
+    assert hits, "Expected API canon retrieval hits"
+    assert any("GameTelemetryService" in h.content or "TriggerGameActions" in h.content for h in hits)
+
+
+
 
 

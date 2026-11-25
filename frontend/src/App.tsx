@@ -101,7 +101,7 @@ const DEFAULT_PERSONA: PersonaProfile = {
 export default function App() {
   const [stageMode, setStageMode] = useState<"core" | "hologram">("core");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<"systems" | "rag" | "receipts" | "persona" | "config">("config");
+  const [settingsTab, setSettingsTab] = useState<"systems" | "rag" | "receipts" | "persona" | "config" | "api">("config");
   const [holoCommand, setHoloCommand] = useState<HologramCommand | null>(null);
 
   const [ship, setShip] = useState<ShipTelemetry>(DEFAULT_SHIP);
@@ -668,8 +668,8 @@ export default function App() {
     }
     if (cmd.type === "ui_nav") {
       const act = String(cmd.action || "");
-      const tab = cmd.tab as "systems" | "rag" | "receipts" | "persona" | "config" | undefined;
-      if (tab && ["config", "persona", "systems", "rag", "receipts"].includes(tab)) {
+      const tab = cmd.tab as "systems" | "rag" | "receipts" | "persona" | "config" | "api" | undefined;
+      if (tab && ["config", "persona", "systems", "rag", "receipts", "api"].includes(tab)) {
         setSettingsTab(tab);
       }
       if (act === "open_settings" || act === "switch_tab") {

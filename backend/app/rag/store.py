@@ -571,6 +571,43 @@ class MemoryStore:
             for r in rows
         ]
 
+    def sync_api_reference_doc(self, doc_path: Path) -> int:
+        """Chunk docs/STAR_CITIZEN_AND_AETHER_API.md into locked SQLite Auto-RAG canon (domain='api_canon').
+
+        Idempotent: only inserts/updates sections whose text changed, so restarts never create duplicates.
+        """
+        if not doc_path.is_file():
+            return 0
+        raw_md = doc_path.read_text(encoding="utf-8")
+        sections = parse_markdown_api_sections(raw_md)
+        synced = 0
+        for idx, sec in enumerate(sections, start=1):
+            slug = re.sub(r"[^a-z0-9]+", "_", sec["title"].lower()).strip("_")[:48] or f"sec_{idx}"
+            sem_key = f"api_canon.{slug}"
+            body_compact = re.sub(r"\n{3,}", "\n\n", sec["body"]).strip()
+            # Keep each API canon chunk concise & voice-friendly so 4-5 sections fit in RAG budget together
+            chunk_text = f"API Reference — {sec['title']}: {body_compact}"[:880]
+            cleaned_text = sanitize_untrusted_text(chunk_text).cleaned
+
+            existing = self.conn.execute(
+                "SELECT id, content FROM memories WHERE semantic_key = ? AND superseded_by IS NULL LIMIT 1",
+                (sem_key,),
+            ).fetchone()
+            if existing and existing["content"] == cleaned_text:
+                continue
+
+            self.add_memory(
+                content=chunk_text,
+                domain="api_canon",
+                truth_class="lore_canon",
+                provenance="official_api_doc",
+                scope="public",
+                semantic_key=sem_key,
+                confidence=1.0,
+            )
+            synced += 1
+        return synced
+
     def list_security_audit(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM security_audit ORDER BY created_at DESC LIMIT ?",
@@ -754,3 +791,37 @@ class MemoryStore:
                 break
 
         return deduped
+
+
+def parse_markdown_api_sections(raw_md: str) -> list[dict[str, Any]]:
+    """Parse markdown document into clean top/sub sections for both RAG chunking and Settings UI display."""
+    sections: list[dict[str, Any]] = []
+    cur_title = "Overview"
+    cur_level = 1
+    cur_lines: list[str] = []
+
+    def _flush() -> None:
+        body = "\n".join(cur_lines).strip()
+        if body and cur_title != "Overview":
+            sections.append(
+                {
+                    "id": f"sec_{len(sections) + 1}",
+                    "level": cur_level,
+                    "title": cur_title,
+                    "body": body,
+                }
+            )
+
+    for line in raw_md.splitlines():
+        m = re.match(r"^(#{2,3})\s+(.+)$", line.strip())
+        if m:
+            _flush()
+            cur_level = len(m.group(1))
+            cur_title = m.group(2).strip()
+            cur_lines = []
+        else:
+            if line.strip() == "---":
+                continue
+            cur_lines.append(line)
+    _flush()
+    return sections

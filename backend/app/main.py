@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -23,7 +24,7 @@ from .network.lobby import (
 )
 from .rag.compiler import PromptCompiler
 from .rag.embeddings import embed_via_player2
-from .rag.store import MemoryStore
+from .rag.store import MemoryStore, parse_markdown_api_sections
 from .telemetry.actions import ActionExecutor
 from .telemetry.grpc_bridge import StarCitizenGrpcBridge
 from .telemetry.simulator import TelemetrySimulator
@@ -118,10 +119,14 @@ class ConfigUpdateRequest(BaseModel):
     wake_word_enabled: bool | None = None
 
 
+API_DOC_PATH = Path(__file__).resolve().parents[2] / "docs" / "STAR_CITIZEN_AND_AETHER_API.md"
+
+
 class AetherRuntime:
     def __init__(self) -> None:
         self.config = AetherConfig.load_or_default()
         self.store = MemoryStore(self.config.db_path)
+        self.store.sync_api_reference_doc(API_DOC_PATH)
         self.compiler = PromptCompiler(self.store)
         self.executor = ActionExecutor(self.store)
         self.simulator = TelemetrySimulator()
@@ -856,6 +861,21 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/docs/reference")
+def get_api_reference_doc() -> dict[str, Any]:
+    if not API_DOC_PATH.is_file():
+        return {"path": str(API_DOC_PATH), "markdown": "", "sections": [], "indexed_chunks": 0}
+    md = API_DOC_PATH.read_text(encoding="utf-8")
+    sections = parse_markdown_api_sections(md)
+    canon_count = len(runtime.store.list_memories(limit=100, domain="api_canon"))
+    return {
+        "path": "docs/STAR_CITIZEN_AND_AETHER_API.md",
+        "markdown": md,
+        "sections": sections,
+        "indexed_chunks": canon_count,
+    }
 
 
 @app.get("/api/memories")

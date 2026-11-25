@@ -201,8 +201,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     },
                     "tab": {
                         "type": "string",
-                        "enum": ["config", "persona", "systems", "rag", "receipts"],
-                        "description": "Target tab inside Settings modal.",
+                        "enum": ["config", "persona", "systems", "rag", "receipts", "api"],
+                        "description": "Target tab inside Settings modal ('api' opens the formatted Star Citizen & AETHER API Reference).",
                     },
                     "updates": {
                         "type": "object",
@@ -1224,7 +1224,7 @@ class LLMRouter:
         if ui_action in {"open_settings", "close_settings", "switch_tab", "start_calibration", "open_personality_interview"}:
             cmds.append({"type": "ui_nav", "action": ui_action, "tab": tab or None})
             notes.append(f"UI -> {ui_action}" + (f" ({tab})" if tab else ""))
-        elif tab in {"config", "persona", "systems", "rag", "receipts"}:
+        elif tab in {"config", "persona", "systems", "rag", "receipts", "api"}:
             cmds.append({"type": "ui_nav", "action": "switch_tab", "tab": tab})
             notes.append(f"Opened Settings -> {tab}")
 
